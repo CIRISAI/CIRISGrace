@@ -1,0 +1,172 @@
+# The daily driver, run where nobody has to be sitting.
+#
+# Grace's whole point is that ecosystem state is a command rather than a
+# memory. A command you can only run at your desk is still a memory when you
+# are not at your desk, so the board runs here and the answer is legible from
+# a phone three ways: the published flywheel at cirisai.github.io/CIRISGrace,
+# the step summary (which renders in the GitHub mobile app), and
+# `workflow_dispatch`, which is a button you can press from it.
+#
+# Nothing is checked out but this repo. Every gate answers from the network —
+# see grace/upstream.py — and `--root` is pointed at a directory that does not
+# exist on purpose, so a runner that happens to have a sibling lying around
+# cannot make this lane pass for a reason a phone-only run would not have.
+#
+# SETUP: Pages must be enabled for this repo with Source = "GitHub Actions"
+# (Settings → Pages). Until it is, `deploy` fails and `board` still works.
+
+name: readiness
+
+on:
+  schedule:
+    # 11:00 UTC — early morning US Eastern, so the board is already fresh the
+    # first time anyone looks at it rather than being computed on demand.
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: readiness-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Protects the tool, not the ecosystem. Hermetic and fast, so a PR's fate
+  # never depends on upstream weather — a rotted pin in CIRISConformance is a
+  # true finding about the substrate and a false finding about the diff.
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: every gate imports and registers
+        run: |
+          python -m compileall -q grace
+          python -m grace gates
+          # A gate that silently stops registering would take its question with
+          # it, and the board would look clean because it got shorter.
+          n=$(python -m grace gates | grep -c .)
+          echo "registered gates: $n"
+          test "$n" -ge 11
+      - name: the page renders without network
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          from grace import dashboard, flywheel
+          # A fixture, not a live run: this asserts the renderer survives a
+          # report it has never seen, including a gate that errored.
+          rep = {"schema": "ciris-readiness/v1", "repo": "CIRISGrace",
+                 "generated": "2026-01-01T00:00:00+00:00",
+                 "gates": [{"gate": "conformance-green", "status": "error",
+                            "summary": "offline", "tier": "substrate", "detail": {}}],
+                 "totals": {"pass": 0, "fail": 0, "unimplemented": 0, "error": 1},
+                 "tiers": {"substrate": {"totals": {"pass": 0, "fail": 0,
+                           "unimplemented": 0, "error": 1},
+                           "passed_all_gates": False}},
+                 "passed_all_gates": False}
+          html = dashboard.dashboard(rep, [])
+          assert "<svg" in html and "INTEGRITY" in html, "wheel did not render"
+          # Every station must be scored, and an unmeasured one must never be
+          # green — the rule the whole page rests on.
+          st = flywheel.assess(rep)
+          assert len(st) == 8, st
+          assert all(s["rag"] != "green" or s["evidence"] for s in st)
+          print("dashboard ok:", len(html), "bytes")
+          PY
+
+  # The real answer. Scheduled failure mail is the notification: nobody has to
+  # remember to look.
+  board:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # state/ history, in THIS repo only. Never a sibling.
+    outputs:
+      passed: ${{ steps.gates.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: run the gates
+        id: gates
+        continue-on-error: true # a red board must still publish; see below
+        env:
+          # Every sibling is public today, so the ambient token is enough. The
+          # override exists for the day one is not; a gate that needs auth it
+          # does not have reports `error`, never `pass`.
+          GH_TOKEN: ${{ secrets.GRACE_READ_TOKEN || github.token }}
+        run: |
+          python -m grace \
+            --root "$RUNNER_TEMP/deliberately-empty" \
+            --state state --save-state \
+            --json readiness.json \
+            --html site/index.html \
+            --markdown "$GITHUB_STEP_SUMMARY" \
+            --ignore-unimplemented
+
+      # The history is what makes "red since April" distinguishable from "red
+      # since breakfast", so it is committed rather than kept in a cache that
+      # evicts. `[skip ci]` stops this push from re-triggering the workflow.
+      - name: commit the history
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "grace[bot]"
+          git config user.email "grace@users.noreply.github.com"
+          git add state/
+          if git diff --cached --quiet; then
+            echo "no state change"
+          else
+            git commit -m "chore(state): readiness $(date -u +%Y-%m-%d) [skip ci]"
+            git push
+          fi
+
+      - name: publish the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ciris-readiness
+          path: readiness.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: upload the page
+        if: always()
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      # Deferred to the end so a red board still publishes its page and its
+      # history first. The lane's colour is the notification; losing the
+      # artifact that explains it would defeat the point.
+      - name: fail the lane if anything regressed
+        if: steps.gates.outcome == 'failure'
+        run: |
+          echo "::error::Gates reported fail/error — see the job summary and the flywheel."
+          exit 1
+
+  # `always()` so the page still deploys when the board is red. A dashboard
+  # that only updates on good news is a dashboard that lies by omission — and
+  # red is exactly when someone goes looking at it.
+  deploy:
+    needs: board
+    if: always() && needs.board.result != 'skipped' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.pages.outputs.page_url }}
+    steps:
+      - id: pages
+        uses: actions/deploy-pages@v4

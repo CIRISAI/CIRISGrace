@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 *.json.tmp
 reports/
+# the generated page — built fresh each run and deployed to Pages, never committed
+site/
+readiness.json

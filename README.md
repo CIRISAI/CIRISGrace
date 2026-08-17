@@ -24,13 +24,56 @@ python -m grace                  # run every gate, print the board
 python -m grace gates            # list the gates and what each one asks
 python -m grace run floor-currency conformance-green
 python -m grace --json out.json  # machine-readable report
+python -m grace --markdown b.md  # the board as markdown (e.g. a step summary)
 python -m grace --offline        # skip anything needing network
 python -m grace --root ~/src     # where the CIRIS* checkouts live (default ~)
 ```
 
 Exit code is 0 only when every gate passed.
 
+## From the road
+
+The board runs itself. `.github/workflows/readiness.yml` runs every gate daily
+at 11:00 UTC and on demand, and publishes three ways:
+
+- **[cirisai.github.io/CIRISGrace](https://cirisai.github.io/CIRISGrace)** — the
+  flywheel: eight stations of the ecosystem lifecycle as one turning wheel, each
+  expandable to the gates behind its RAG colour and linking out to its repos.
+  See [`FSD/OPERATIONS.md`](FSD/OPERATIONS.md).
+- the **job summary**, which renders in the GitHub mobile app;
+- `ciris-readiness/v1` JSON as a build artifact.
+
+`workflow_dispatch` is the button. Nothing needs installing and nothing needs
+cloning.
+
+**Deltas.** Each run is compared against the last and the comparison is
+published with the board, because a snapshot cannot tell "red since April" from
+"red since breakfast" — which is the only distinction that decides whether you
+act now. History lives in `state/`, committed here. Alerts are **changes**, not
+conditions; a failure standing for three runs is escalated once more, because
+"nobody picked this up" is itself a new fact.
+
+**No checkout is required, of anything.** A local sibling is used when present
+because it is faster and works offline, but every gate can answer from the
+network alone: the upstream tree is materialised with an anonymous shallow
+clone, so no token is needed either. The CI lane deliberately points `--root`
+at a directory that does not exist, so it can only ever pass for reasons a
+phone-only run would also have.
+
+The scheduled run uses `--ignore-unimplemented`, which changes **the exit code
+only** — a declared gap does not turn the lane red. The published report still
+says `passed_all_gates=false` for as long as the gaps are open. A lane that is
+red every morning for a reason everybody already knows is a lane nobody reads
+on the morning it goes red for a new one.
+
 ## Gates
+
+Two tiers, rolled up separately. `substrate` answers *can I cut today*;
+`ecosystem` answers *what is rotting while I am not looking*. Folding ~48
+repositories into the first question's boolean would make it permanently false,
+and a boolean that is always false is one nobody reads.
+
+**substrate**
 
 | id | asks |
 |---|---|
@@ -42,6 +85,19 @@ Exit code is 0 only when every gate passed.
 | `constitution-pinned` | Is the Constitution pinned to a version and a commit? |
 | `wire-vocabulary-pinned` | Is the CEG wire-vocabulary version pinned? — **not implemented** |
 | `head-advance` | Is there a newer coherent set than the one on main? — **not implemented** |
+
+**ecosystem** — public, non-archived repositories only
+
+| id | asks |
+|---|---|
+| `build-chain` | Where in verify→persist→edge→server→agent has a change stopped? |
+| `estate-backlog` | Does every public repo with an open backlog still show movement on it? |
+| `blocked-upstream` | Does the blocked-upstream ledger still match reality? |
+
+`blocked-upstream` re-runs every scannable predicate in
+`evidence/blocked_upstream.tsv`. **A landed obligation turns it red**, on
+purpose: it is the same state machine as a strict xfail, so there is no state
+in which the fix shipped upstream and nothing here noticed.
 
 ## Where the set comes from
 
