@@ -29,6 +29,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from . import upstream
 from .gate import (
     ERROR,
     FAIL,
@@ -48,42 +49,31 @@ SET_SCHEMA = "ciris-coherent-set/v1"
 INTEGRATOR = "CIRISServer"
 
 
+# ── materialising the upstream tree ──────────────────────────────────────
+
+
+def conformance_tree(ctx: Context) -> tuple[Path, str]:
+    """CIRISConformance at `origin/main`, materialised once per run."""
+    return upstream.tree(ctx, CONFORMANCE)
+
+
 # ── reading the published set ────────────────────────────────────────────
 
 
 def read_set(ctx: Context) -> tuple[dict, str]:
-    """Return (coherent_set, source).
-
-    Runs Conformance's own emitter against `origin/main` — never the working
-    tree, which can sit on a branch or be months stale.
-    """
-    repo = ctx.repo(CONFORMANCE)
-    if (repo / ".git").exists():
-        with tempfile.TemporaryDirectory() as tmp:
-            rc, out = run(["git", "archive", "--format=tar", "-o", f"{tmp}/m.tar", "origin/main"], cwd=repo)
-            if rc == 0:
-                run(["tar", "-xf", f"{tmp}/m.tar", "-C", tmp])
-                rc, out = run(["python3", f"{tmp}/tools/install_pins.py", "--print-set",
-                               "--matrix", f"{tmp}/matrices/current.yaml"], timeout=120)
-                if rc == 0:
-                    return _validate(json.loads(out)), f"{repo}@origin/main"
-
-    if ctx.offline:
-        raise RuntimeError(f"no usable {CONFORMANCE} checkout and --offline was given")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        for rel in ("tools/install_pins.py", "matrices/current.yaml"):
-            rc, out = run(["gh", "api", f"repos/CIRISAI/{CONFORMANCE}/contents/{rel}", "--jq", ".content"])
-            if rc != 0:
-                raise RuntimeError(f"gh api {rel} failed: {out}")
-            dest = Path(tmp) / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(base64.b64decode(out))
-        rc, out = run(["python3", f"{tmp}/tools/install_pins.py", "--print-set",
-                       "--matrix", f"{tmp}/matrices/current.yaml"], timeout=120)
-        if rc != 0:
-            raise RuntimeError(f"--print-set failed: {out}")
-        return _validate(json.loads(out)), f"github:CIRISAI/{CONFORMANCE}@main"
+    """Return (coherent_set, source), from Conformance's own emitter."""
+    if "set" in ctx.cache:
+        return ctx.cache["set"]
+    tree, source = conformance_tree(ctx)
+    rc, out = run(
+        ["python3", str(tree / "tools/install_pins.py"), "--print-set",
+         "--matrix", str(tree / "matrices/current.yaml")],
+        timeout=120,
+    )
+    if rc != 0:
+        raise RuntimeError(f"--print-set failed: {out}")
+    ctx.cache["set"] = (_validate(json.loads(out)), source)
+    return ctx.cache["set"]
 
 
 def _validate(doc: dict) -> dict:
@@ -345,18 +335,24 @@ def xfail_ledger(ctx: Context) -> Result:
     ledger is a backlog with an enforcement mechanism attached. The matrix also
     carries `known_failures` entries with an id, url and affected tests; both
     are counted.
+
+    Reads `origin/main` via `conformance_tree`, not the sibling working tree.
+    It used to read the checkout directly, which was wrong twice over: it made
+    the gate unrunnable on a CI runner, and it reported whatever branch the
+    checkout happened to be parked on as if it were shipped state.
     """
-    repo = ctx.repo(CONFORMANCE)
-    tests = repo / "tests"
+    tree, source = conformance_tree(ctx)
+    tests = tree / "tests"
     if not tests.exists():
-        return Result("xfail-ledger", ERROR, f"{tests} not found (clone {CONFORMANCE})")
+        return Result("xfail-ledger", ERROR, f"no tests/ in {source}")
     # Match the DECORATOR only. `xfail(strict)` appears in plenty of docstrings
     # describing history ("was xfail(strict) on persist 12.5.0"), and counting
     # those as unlinked gaps would make this gate lie.
     marker = re.compile(r"^[ \t]*@pytest\.mark\.xfail\(", re.M)
     issue = re.compile(r"(CIRIS[A-Za-z]+)#(\d+)")
     entries = []
-    for path in sorted(tests.glob("test_*.py")):
+    files = sorted(tests.glob("test_*.py"))
+    for path in files:
         text = path.read_text(errors="replace")
         for m in marker.finditer(text):
             body = _balanced(text, m.end() - 1)
@@ -364,13 +360,28 @@ def xfail_ledger(ctx: Context) -> Result:
             entries.append(
                 {"test": path.name, "strict": "strict=True" in body, "issues": refs}
             )
+    # A parser that finds nothing where the thing plainly exists must fail
+    # loudly rather than report an empty ledger as a clean one. Both of these
+    # are "the tree moved underneath us", not "the backlog is empty" — and the
+    # difference is invisible in a green tick.
+    if not files:
+        return Result("xfail-ledger", ERROR, f"no test_*.py under {source}:tests/")
+    if not entries:
+        return Result(
+            "xfail-ledger",
+            ERROR,
+            f"no @pytest.mark.xfail decorator matched across {len(files)} test files — "
+            "the suite's marker shape changed, or the tree is not what we think",
+            {"files": len(files), "source": source},
+        )
     unlinked = [e for e in entries if not e["issues"]]
     status = PASS if not unlinked else FAIL
     return Result(
         "xfail-ledger",
         status,
-        f"{len(entries)} xfail(s), {len(unlinked)} without an issue reference",
-        {"xfails": entries},
+        f"{len(entries)} xfail(s) across {len(files)} files, "
+        f"{len(unlinked)} without an issue reference",
+        {"xfails": entries, "source": source},
     )
 
 
