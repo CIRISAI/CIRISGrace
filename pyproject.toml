@@ -1,0 +1,14 @@
+[project]
+name = "ciris-grace"
+version = "0.1.0"
+description = "Daily readiness gates for the CIRIS ecosystem"
+requires-python = ">=3.10"
+dependencies = []            # stdlib only, on purpose — see AGENTS.md
+license = { text = "AGPL-3.0-or-later" }
+
+[project.scripts]
+grace = "grace.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

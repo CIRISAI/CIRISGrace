@@ -1,0 +1,19 @@
+# CIRIS evidence registry — the `state:blocked-upstream` adoption manifest.
+# Format mirrors CIRISServer/evidence/blocked_upstream.tsv (CIRISServer#361).
+#
+# Each row is an upstream obligation this repo is waiting on, expressed as a
+# SCANNABLE PREDICATE: a needle whose appearance in the named tree means the
+# obligation landed. A prose note creates an obligation nowhere; a predicate
+# creates one a test can read.
+#
+# kind: absence  — the needle is absent today; its arrival IS the fix landing
+#       drift    — the needle exists but at the wrong count/place
+#       untestable — the repo is not in this repo's reachable tree; nothing to scan
+#
+# Counts (files/lines) were measured against CIRISConformance origin/main
+# @3ab8b75 (2026-07-20) on 2026-08-16.
+issue	repo	scan_root	glob	needle	files	lines	kind	predicate
+86	CIRISConformance	.github/workflows	*.yml	head\.yaml	0	0	absence	The daily head recompute (#86 §0). The floor is hand-bumped, so it rots: on 2026-08-16 the pinned ciris-server==0.5.131 was no longer installable from PyPI at all. When a workflow writes or reads matrices/head.yaml, the recompute has landed.
+86	CIRISConformance	matrices	*.yaml	^cc_version:|^wire_vocabulary:	0	0	absence	Normative pins as FIELDS (#86 §4 class 3). The Constitution version is tracked in prose inside pin comments (e.g. "CC unchanged (1.0-rc2, commit 5818a75)") and the wire vocabulary lives in a markdown file. grace/substrate.py:normative_pins stays unimplemented until one of these keys exists.
+86	CIRISConformance	.github/workflows	*.yml	run-against-client	0	0	absence	The client lane (#86 §2). run-against-wheels.yml exists and takes under-test-wheel-artifact; the client twin takes an AAR/JAR/XCFramework plus flavor and platform. Its arrival is what lets a client regression turn a consumer tag-run red.
+86	CIRISConformance	.	conftest.py	"client"	0	0	absence	The third marker. conftest.pytest_collection_modifyitems partitions the suite into substrate and fabric; a client tier needs a third. Zero occurrences of the literal today.
