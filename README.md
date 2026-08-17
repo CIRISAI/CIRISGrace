@@ -34,17 +34,40 @@ Exit code is 0 only when every gate passed.
 
 | id | asks |
 |---|---|
-| `floor-pins-indexed` | Is every pinned wheel still installable from PyPI? |
-| `floor-currency` | How far is the floor behind what is published? |
-| `coherent-resolution` | Does the floor set resolve together? |
+| `set-members-available` | Is every member of the coherent set actually fetchable? |
+| `set-currency` | How far is the set behind its own currency sources? |
+| `coherent-resolution` | Does the set install together? |
 | `conformance-green` | Did the conformance suite last pass on main? |
-| `xfail-ledger` | Which gates are declared-but-unmet, and are their issues linked? |
-| `normative-pins` | Are the CC and wire-vocabulary versions pinned? — **not implemented** |
-| `head-advance` | Is there a newer coherent set than the floor? — **not implemented** |
+| `xfail-ledger` | Which gates are declared-but-unmet, and are their issues named? |
+| `constitution-pinned` | Is the Constitution pinned to a version and a commit? |
+| `wire-vocabulary-pinned` | Is the CEG wire-vocabulary version pinned? — **not implemented** |
+| `head-advance` | Is there a newer coherent set than the one on main? — **not implemented** |
 
-The floor is CIRISConformance's `matrices/current.yaml`, read from
-`origin/main` rather than the working tree — a checkout on a feature branch or
-months stale will otherwise report against a floor nobody ships.
+## Where the set comes from
+
+Grace does **not** parse `matrices/current.yaml`. That file's shape belongs to
+CIRISConformance and has already changed underneath us once. The set is read
+through the contract Conformance publishes for downstream readers:
+
+```console
+$ python tools/install_pins.py --print-set     # → ciris-coherent-set/v1
+```
+
+run against `origin/main` rather than the working tree, because a checkout can
+sit on a feature branch or be months stale.
+
+The family ships on **two channels**, and `channel` is the load-bearing field:
+
+- `pypi` — currency is the newest published release.
+- `git` — built from a pinned tag and sha; currency is the tag the
+  **integrator** pins in `CIRISServer` main's `Cargo.toml`. Asking PyPI about a
+  git member returns an answer, and that answer is an abandoned release many
+  majors behind.
+
+A member arriving with a channel Grace does not recognise raises rather than
+being skipped, so the next channel the family invents cannot silently shrink
+the set. See [CIRISGrace#1](https://github.com/CIRISAI/CIRISGrace/issues/1) for
+the failure this rule was written against.
 
 ## Statuses
 

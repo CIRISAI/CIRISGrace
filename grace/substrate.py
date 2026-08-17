@@ -2,9 +2,22 @@
 
 These answer one question: *is the substrate in a state I can cut from today?*
 
-The floor is CIRISConformance's `matrices/current.yaml` — the consciously
-chosen set that a release must clear. These gates compare the world against
-that floor and report the delta. They do not change it.
+The set under test is CIRISConformance's coherent set. Grace does **not** parse
+`matrices/current.yaml`: that file's shape belongs to Conformance and has
+already changed once underneath us. It is read through the contract Conformance
+publishes for downstream readers:
+
+    python tools/install_pins.py --print-set   →  ciris-coherent-set/v1
+
+The family ships on two channels — PyPI wheels, and git tags built from source
+for members whose desktop wheels stopped publishing. `channel` is the
+load-bearing field: a `pypi` member's currency question is answered by PyPI, a
+`git` member's by the integrator's own `Cargo.toml`. Asking PyPI about a git
+member returns an answer, and that answer is abandoned and majors behind.
+
+See CIRISGrace#1 for the failure this module is written against: the previous
+regex reader matched the PyPI half of the two-channel matrix and reported
+`passed_all_gates=true` over half the set.
 """
 
 from __future__ import annotations
@@ -12,6 +25,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import sys
 import tempfile
 from pathlib import Path
 
@@ -30,164 +44,258 @@ from .gate import (
 )
 
 CONFORMANCE = "CIRISConformance"
-PIN_RE = re.compile(r'^\s{2}(ciris-[a-z-]+):\s+"([0-9][0-9A-Za-z.\-]*)"', re.M)
+SET_SCHEMA = "ciris-coherent-set/v1"
+INTEGRATOR = "CIRISServer"
 
 
-def read_floor(ctx: Context) -> tuple[dict[str, str], str]:
-    """Return ({package: version}, source). Local checkout first, then GitHub.
+# ── reading the published set ────────────────────────────────────────────
 
-    Parsed with a regex rather than a YAML library on purpose: the file is
-    stdlib-parseable, and the pin comments are long enough that a YAML load
-    buys nothing here.
+
+def read_set(ctx: Context) -> tuple[dict, str]:
+    """Return (coherent_set, source).
+
+    Runs Conformance's own emitter against `origin/main` — never the working
+    tree, which can sit on a branch or be months stale.
     """
     repo = ctx.repo(CONFORMANCE)
-    rel = "matrices/current.yaml"
-
-    # Prefer origin/main over the working tree. A local checkout can sit on a
-    # feature branch, or simply be months behind — reading the dirty tree is
-    # how you end up confidently reporting against a floor nobody ships.
     if (repo / ".git").exists():
-        rc, out = run(["git", "show", f"origin/main:{rel}"], cwd=repo)
-        if rc == 0 and out:
-            return dict(PIN_RE.findall(out)), f"{repo}@origin/main"
-
-    local = repo / rel
-    if local.exists():
-        return dict(PIN_RE.findall(local.read_text())), f"{local} (working tree)"
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, out = run(["git", "archive", "--format=tar", "-o", f"{tmp}/m.tar", "origin/main"], cwd=repo)
+            if rc == 0:
+                run(["tar", "-xf", f"{tmp}/m.tar", "-C", tmp])
+                rc, out = run(["python3", f"{tmp}/tools/install_pins.py", "--print-set",
+                               "--matrix", f"{tmp}/matrices/current.yaml"], timeout=120)
+                if rc == 0:
+                    return _validate(json.loads(out)), f"{repo}@origin/main"
 
     if ctx.offline:
-        raise RuntimeError(f"{local} not found and --offline was given")
+        raise RuntimeError(f"no usable {CONFORMANCE} checkout and --offline was given")
 
-    rc, out = run(
-        [
-            "gh",
-            "api",
-            f"repos/CIRISAI/{CONFORMANCE}/contents/matrices/current.yaml",
-            "--jq",
-            ".content",
-        ]
+    with tempfile.TemporaryDirectory() as tmp:
+        for rel in ("tools/install_pins.py", "matrices/current.yaml"):
+            rc, out = run(["gh", "api", f"repos/CIRISAI/{CONFORMANCE}/contents/{rel}", "--jq", ".content"])
+            if rc != 0:
+                raise RuntimeError(f"gh api {rel} failed: {out}")
+            dest = Path(tmp) / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(base64.b64decode(out))
+        rc, out = run(["python3", f"{tmp}/tools/install_pins.py", "--print-set",
+                       "--matrix", f"{tmp}/matrices/current.yaml"], timeout=120)
+        if rc != 0:
+            raise RuntimeError(f"--print-set failed: {out}")
+        return _validate(json.loads(out)), f"github:CIRISAI/{CONFORMANCE}@main"
+
+
+def _validate(doc: dict) -> dict:
+    """Refuse a set we do not fully understand.
+
+    Silently dropping a member we cannot classify is the exact bug this module
+    exists to not repeat, so an unknown shape raises instead of shrinking the
+    set. The next channel the family invents fails loudly here.
+    """
+    schema = doc.get("schema")
+    if schema != SET_SCHEMA:
+        raise RuntimeError(f"unexpected schema {schema!r}, expected {SET_SCHEMA!r}")
+    members = doc.get("members") or {}
+    if not members:
+        raise RuntimeError("coherent set carries no members")
+    unclassified = [n for n, m in members.items() if m.get("channel") not in ("pypi", "git")]
+    if unclassified:
+        raise RuntimeError(
+            "member(s) with no known channel: " + ", ".join(sorted(unclassified))
+        )
+    return doc
+
+
+def integrator_tags(ctx: Context) -> dict[str, str]:
+    """Tags the integrator pins, read from CIRISServer main's Cargo.toml.
+
+    This is the currency source a git-channel member declares. A member ahead
+    of the integrator is not yet in the coherent set, so the integrator — not
+    the member's own repo head — is the reference.
+    """
+    repo = ctx.repo(INTEGRATOR)
+    text = ""
+    if (repo / ".git").exists():
+        rc, out = run(["git", "show", "origin/main:Cargo.toml"], cwd=repo)
+        if rc == 0:
+            text = out
+    if not text:
+        if ctx.offline:
+            raise RuntimeError("no CIRISServer checkout and --offline was given")
+        rc, out = run(["gh", "api", f"repos/CIRISAI/{INTEGRATOR}/contents/Cargo.toml", "--jq", ".content"])
+        if rc != 0:
+            raise RuntimeError(f"gh api Cargo.toml failed: {out}")
+        text = base64.b64decode(out).decode()
+    # Anchor on the repo path, not a bare name: the URL carries the ORG first
+    # (`github.com/CIRISAI/CIRISPersist`), so a `CIRIS[A-Za-z]+` alternation
+    # matches `CIRISAI` and walks off with the tag attached to the wrong key.
+    pairs = re.findall(
+        r'github\.com/CIRISAI/(CIRIS[A-Za-z]+)[^\n]*?\btag\s*=\s*"(v[0-9][^"]*)"', text
     )
-    if rc != 0:
-        raise RuntimeError(f"no local matrix and gh api failed: {out}")
-    text = base64.b64decode(out).decode()
-    return dict(PIN_RE.findall(text)), "github:CIRISAI/CIRISConformance@main"
+    if not pairs:
+        raise RuntimeError(
+            "no `github.com/CIRISAI/<repo> … tag = \"vX\"` dependency lines found — "
+            "the integrator's manifest shape changed"
+        )
+    return dict(pairs)
 
 
-def _balanced(text: str, open_paren: int) -> str:
-    """Return the text inside the parens starting at `open_paren`.
-
-    Naive but sufficient here: the decorator arguments are single-line or
-    simply nested, and a stray paren inside a reason string only widens the
-    slice, which cannot produce a false "no issue reference".
-    """
-    depth = 0
-    for i in range(open_paren, len(text)):
-        if text[i] == "(":
-            depth += 1
-        elif text[i] == ")":
-            depth -= 1
-            if depth == 0:
-                return text[open_paren + 1 : i]
-    return text[open_paren + 1 :]
+def repo_name(member: dict) -> str:
+    return (member.get("repo") or "").rstrip("/").rsplit("/", 1)[-1]
 
 
-@gate("floor-pins-indexed", "Is every pinned wheel still installable from PyPI?")
-def floor_pins_indexed(ctx: Context) -> Result:
-    """The retention-rot gate.
+# ── gates ────────────────────────────────────────────────────────────────
 
-    ciris-server's PyPI index retains only a handful of releases, so a pin
-    that was fine last month can become uninstallable without anything in
-    any repo changing. That failure shows up downstream as every
-    cohabitation cell failing identically at pip-install time.
+
+@gate("set-members-available", "Is every member of the coherent set actually fetchable?")
+def set_members_available(ctx: Context) -> Result:
+    """PyPI members must still be indexed; git members must still resolve.
+
+    Named for the set, not for `evidence/floor_pins.txt` — the two are allowed
+    to differ, and this gate is about the matrix.
+
+    The PyPI half is the retention-rot check: ciris-server's index retains only
+    a handful of releases, so a pin that installed last month can stop
+    installing with nothing in any repo changing. The git half is the same
+    question for a tag: does the recorded sha still exist upstream. Conformance
+    ships `install_pins.py --verify-refs` for the whole-set version of this.
     """
     if ctx.offline:
-        return Result("floor-pins-indexed", ERROR, "offline")
-    pins, source = read_floor(ctx)
-    missing, checked = {}, {}
-    for pkg, want in pins.items():
-        try:
-            releases = pypi(pkg)["releases"]
-        except Exception as exc:
-            return Result("floor-pins-indexed", ERROR, f"{pkg}: {exc}")
-        # A version with no files left is indexed but not installable.
-        if want not in releases or not releases[want]:
-            missing[pkg] = want
-        checked[pkg] = want
-    if missing:
-        detail = ", ".join(f"{p}=={v}" for p, v in sorted(missing.items()))
+        return Result("set-members-available", ERROR, "offline")
+    doc, source = read_set(ctx)
+    members = doc["members"]
+    bad, ok = [], {}
+    for name, m in sorted(members.items()):
+        if m["channel"] == "pypi":
+            want = m["version"]
+            try:
+                releases = pypi(name)["releases"]
+            except Exception as exc:
+                return Result("set-members-available", ERROR, f"{name}: {exc}")
+            if want not in releases or not releases[want]:
+                bad.append(f"{name}=={want} (evicted from the index)")
+            else:
+                ok[name] = f"pypi {want}"
+        else:
+            sha, tag, url = m.get("sha"), m.get("tag"), m.get("repo")
+            rc, out = run(["git", "ls-remote", url, f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}"], timeout=60)
+            if rc != 0:
+                return Result("set-members-available", ERROR, f"{name}: ls-remote failed: {out}")
+            seen = {line.split()[0] for line in out.splitlines() if line.strip()}
+            if not seen:
+                bad.append(f"{name} {tag} (tag missing upstream)")
+            elif sha and sha not in seen:
+                bad.append(f"{name} {tag} moved off {sha[:8]}")
+            else:
+                ok[name] = f"git {tag}"
+    if bad:
         return Result(
-            "floor-pins-indexed",
+            "set-members-available",
             FAIL,
-            f"{len(missing)} pin(s) no longer installable: {detail}",
-            {"missing": missing, "source": source},
+            f"{len(bad)} of {len(members)} member(s) unfetchable: " + "; ".join(bad),
+            {"unfetchable": bad, "ok": ok, "source": source},
         )
     return Result(
-        "floor-pins-indexed",
+        "set-members-available",
         PASS,
-        f"{len(checked)} pins installable",
-        {"pins": checked, "source": source},
+        f"all {len(members)} members fetchable ({sum(1 for m in members.values() if m['channel'] == 'pypi')} pypi, "
+        f"{sum(1 for m in members.values() if m['channel'] == 'git')} git)",
+        {"members": ok, "source": source},
     )
 
 
-@gate("floor-currency", "How far is the floor behind what is published?")
-def floor_currency(ctx: Context) -> Result:
-    """Reports the delta, and fails only when a pin has fallen behind.
+@gate("set-currency", "How far is the coherent set behind its own currency sources?")
+def set_currency(ctx: Context) -> Result:
+    """Per channel, because the question differs.
 
-    This is the number that says whether the floor is governing the stack
-    or trailing it.
+    `pypi` → the newest published release. `git` → the tag the integrator pins
+    in CIRISServer main's Cargo.toml. Asking PyPI about a git member is the
+    subtle half of CIRISGrace#1: persist and edge still have abandoned PyPI
+    releases many majors behind their git tags, so the check would report the
+    set going *backwards* with total confidence.
     """
     if ctx.offline:
-        return Result("floor-currency", ERROR, "offline")
-    pins, source = read_floor(ctx)
-    behind, current = {}, {}
-    for pkg, want in pins.items():
-        try:
-            data = pypi(pkg)
-        except Exception as exc:
-            return Result("floor-currency", ERROR, f"{pkg}: {exc}")
-        latest = data["info"]["version"]
-        if parse_version(latest) > parse_version(want):
-            behind[pkg] = {"pinned": want, "latest": latest}
+        return Result("set-currency", ERROR, "offline")
+    doc, source = read_set(ctx)
+    members = doc["members"]
+    try:
+        tags = integrator_tags(ctx)
+    except Exception as exc:
+        return Result("set-currency", ERROR, f"integrator Cargo.toml: {exc}")
+
+    behind, current, unknown = {}, {}, []
+    for name, m in sorted(members.items()):
+        if m["channel"] == "pypi":
+            want = m["version"]
+            try:
+                latest = pypi(name)["info"]["version"]
+            except Exception as exc:
+                return Result("set-currency", ERROR, f"{name}: {exc}")
+            if parse_version(latest) > parse_version(want):
+                behind[name] = {"pinned": want, "latest": latest, "source": "pypi"}
+            else:
+                current[name] = f"pypi {want}"
         else:
-            current[pkg] = want
+            pinned, rn = m.get("tag"), repo_name(m)
+            integrator = tags.get(rn)
+            if not integrator:
+                unknown.append(f"{name}: no tag for {rn} in the integrator's Cargo.toml")
+            elif integrator != pinned:
+                behind[name] = {"pinned": pinned, "latest": integrator, "source": f"{INTEGRATOR}/Cargo.toml"}
+            else:
+                current[name] = f"git {pinned}"
+
+    if unknown:
+        # Cannot answer ≠ answered yes.
+        return Result("set-currency", FAIL, "; ".join(unknown), {"current": current, "behind": behind})
     if behind:
-        detail = ", ".join(
-            f"{p} {d['pinned']}→{d['latest']}" for p, d in sorted(behind.items())
-        )
+        detail = ", ".join(f"{n} {d['pinned']}→{d['latest']}" for n, d in sorted(behind.items()))
         return Result(
-            "floor-currency",
+            "set-currency",
             FAIL,
-            f"{len(behind)} of {len(pins)} pins behind: {detail}",
+            f"{len(behind)} of {len(members)} members behind: {detail}",
             {"behind": behind, "current": current, "source": source},
         )
-    return Result("floor-currency", PASS, f"all {len(pins)} pins current", {"pins": current})
+    return Result(
+        "set-currency",
+        PASS,
+        f"all {len(members)} members at their currency source",
+        {"members": current, "source": source},
+    )
 
 
-@gate("coherent-resolution", "Does the floor set resolve together?")
+@gate("coherent-resolution", "Does the set install together?")
 def coherent_resolution(ctx: Context) -> Result:
-    """A pip dry-run over the whole set.
+    """A pip dry-run over the set's own `install_args`.
 
-    Resolution failure is the ResolutionImpossible case that shows up when
-    one member's ceiling excludes another member's floor.
+    Uses the published args rather than rebuilding `==` specs, so a git member
+    is installed from its pinned sha the way CI installs it.
     """
     if ctx.offline:
         return Result("coherent-resolution", ERROR, "offline")
-    pins, _ = read_floor(ctx)
-    specs = [f"{p}=={v}" for p, v in sorted(pins.items())]
+    doc, _ = read_set(ctx)
+    args = doc.get("install_args") or []
+    if not args:
+        return Result("coherent-resolution", ERROR, "set carries no install_args")
     with tempfile.TemporaryDirectory() as tmp:
         rc, out = run(
-            ["pip", "install", "--dry-run", "--quiet", "--target", tmp, *specs],
-            timeout=300,
+            [sys.executable, "-m", "pip", "install", "--dry-run", "--quiet", "--target", tmp, *args],
+            timeout=900,
         )
     if rc != 0:
-        tail = "\n".join(out.splitlines()[-6:])
+        # "the resolver said no" and "the resolver never ran" are different
+        # answers, and only the first one is a finding. rc 127/124 are the
+        # runner's own not-found/timeout codes; a missing pip module is the
+        # same class.
+        broke = rc in (124, 127) or "No module named pip" in out
         return Result(
             "coherent-resolution",
-            FAIL,
-            "set does not resolve",
-            {"specs": specs, "pip": tail},
+            ERROR if broke else FAIL,
+            "could not run the resolver" if broke else "set does not resolve",
+            {"install_args": args, "pip": "\n".join(out.splitlines()[-8:]), "rc": rc},
         )
-    return Result("coherent-resolution", PASS, f"{len(specs)} wheels resolve together", {"specs": specs})
+    return Result("coherent-resolution", PASS, f"{len(args)} members resolve together", {"install_args": args})
 
 
 @gate("conformance-green", "Did the conformance suite last pass on main?")
@@ -198,19 +306,9 @@ def conformance_green(ctx: Context) -> Result:
         return Result("conformance-green", ERROR, "gh not installed")
     rc, out = run(
         [
-            "gh",
-            "run",
-            "list",
-            "--repo",
-            f"CIRISAI/{CONFORMANCE}",
-            "--workflow",
-            "conformance.yml",
-            "--branch",
-            "main",
-            "--limit",
-            "1",
-            "--json",
-            "conclusion,displayTitle,createdAt,url",
+            "gh", "run", "list", "--repo", f"CIRISAI/{CONFORMANCE}",
+            "--workflow", "conformance.yml", "--branch", "main", "--limit", "1",
+            "--json", "status,conclusion,displayTitle,createdAt,url",
         ]
     )
     if rc != 0:
@@ -219,21 +317,34 @@ def conformance_green(ctx: Context) -> Result:
     if not runs:
         return Result("conformance-green", ERROR, "no runs found")
     r = runs[0]
-    status = PASS if r.get("conclusion") == "success" else FAIL
+    when = r.get("createdAt", "")[:10]
+    # A run still going has no conclusion. That is not a failure, but it is
+    # also not green — reporting it as `fail` with an empty conclusion read as
+    # "the suite broke", which is a different and alarming claim.
+    if r.get("status") != "completed":
+        return Result(
+            "conformance-green",
+            FAIL,
+            f"last main run is {r.get('status')} — not yet green (started {when})",
+            {"run": r},
+        )
+    conclusion = r.get("conclusion")
     return Result(
         "conformance-green",
-        status,
-        f"last main run: {r.get('conclusion')} ({r.get('createdAt', '')[:10]})",
+        PASS if conclusion == "success" else FAIL,
+        f"last main run: {conclusion} ({when})",
         {"run": r},
     )
 
 
-@gate("xfail-ledger", "Which gates are declared-but-unmet, and are their issues open?")
+@gate("xfail-ledger", "Which gates are declared-but-unmet, and are their issues named?")
 def xfail_ledger(ctx: Context) -> Result:
-    """Every strict xfail in the suite is a filed gap. This lists them.
+    """Every strict xfail is a filed gap. This lists them.
 
-    A strict xfail that starts passing turns the suite red on purpose, so
-    this ledger is the backlog with an enforcement mechanism attached.
+    A strict xfail that starts passing turns the suite red on purpose, so the
+    ledger is a backlog with an enforcement mechanism attached. The matrix also
+    carries `known_failures` entries with an id, url and affected tests; both
+    are counted.
     """
     repo = ctx.repo(CONFORMANCE)
     tests = repo / "tests"
@@ -254,35 +365,76 @@ def xfail_ledger(ctx: Context) -> Result:
                 {"test": path.name, "strict": "strict=True" in body, "issues": refs}
             )
     unlinked = [e for e in entries if not e["issues"]]
-    summary = f"{len(entries)} xfail(s), {len(unlinked)} without an issue reference"
     status = PASS if not unlinked else FAIL
-    return Result("xfail-ledger", status, summary, {"xfails": entries})
-
-
-@gate("normative-pins", "Are the Constitution and wire-vocabulary versions pinned?")
-def normative_pins(ctx: Context) -> Result:
-    """Not implemented: there is no machine-readable source yet.
-
-    The CC version is tracked in prose inside the matrix pin comments
-    (e.g. `CC unchanged (1.0-rc2, commit 5818a75)`), and the wire vocabulary
-    lives in a markdown file. Both need to become head fields before this
-    gate can ask anything. See CIRISConformance#86 §4 (class 3).
-    """
     return Result(
-        "normative-pins",
-        UNIMPLEMENTED,
-        "CC + wire-vocabulary versions are prose, not fields (Conformance#86 §4)",
+        "xfail-ledger",
+        status,
+        f"{len(entries)} xfail(s), {len(unlinked)} without an issue reference",
+        {"xfails": entries},
     )
 
 
-@gate("head-advance", "Is there a newer coherent set than the floor?")
+def _balanced(text: str, open_paren: int) -> str:
+    """Return the text inside the parens starting at `open_paren`."""
+    depth = 0
+    for i in range(open_paren, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_paren + 1 : i]
+    return text[open_paren + 1 :]
+
+
+@gate("constitution-pinned", "Is the Constitution pinned to a version and a commit?")
+def constitution_pinned(ctx: Context) -> Result:
+    """Was half of `normative-pins`, which was declared unimplemented on the
+    premise that the CC version lived in prose inside the matrix pin comments.
+    Conformance promoted it to a first-class field, so this is a real check now.
+    """
+    if ctx.offline and not ctx.has_repo(CONFORMANCE):
+        return Result("constitution-pinned", ERROR, "offline and no local checkout")
+    doc, source = read_set(ctx)
+    cc = doc.get("constitution") or {}
+    missing = [k for k in ("version", "commit", "repo") if not cc.get(k)]
+    if missing:
+        return Result(
+            "constitution-pinned",
+            FAIL,
+            "constitution pin missing: " + ", ".join(missing),
+            {"constitution": cc, "source": source},
+        )
+    return Result(
+        "constitution-pinned",
+        PASS,
+        f"CC {cc['version']} @ {cc['commit']}",
+        {"constitution": cc, "source": source},
+    )
+
+
+@gate("wire-vocabulary-pinned", "Is the CEG wire-vocabulary version pinned?")
+def wire_vocabulary_pinned(ctx: Context) -> Result:
+    """Not implemented: still prose.
+
+    The other half of the old `normative-pins`. `WIRE_VOCABULARY_KINDS.md` is a
+    markdown file with no version anything can read, and the set carries no
+    field for it. See CIRISConformance#86 §4 (class 3).
+    """
+    return Result(
+        "wire-vocabulary-pinned",
+        UNIMPLEMENTED,
+        "wire vocabulary is a markdown file, not a field (Conformance#86 §4)",
+    )
+
+
+@gate("head-advance", "Is there a newer coherent set than the one on main?")
 def head_advance(ctx: Context) -> Result:
     """Not implemented: this is the daily recompute from Conformance#86 §0.
 
     It should resolve the newest set, run the suite against it, and write
-    `matrices/head.yaml` on green. Until it exists, `floor-currency` is the
-    honest half of the answer: it reports the delta without proving the
-    newer set actually works.
+    `matrices/head.yaml` on green. Until it exists, `set-currency` is the
+    honest half: it reports the delta without proving the newer set works.
     """
     return Result(
         "head-advance",

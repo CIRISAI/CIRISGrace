@@ -66,9 +66,11 @@ access is opt-out via `--offline` so the tool still answers on a train.
 | Component | How it advances M-1 |
 |---|---|
 | `grace/gate.py` | Makes "we did not check that" a first-class, visible state |
-| `grace/substrate.py` | Turns floor rot from something discovered by six red CI cells into something reported before work starts |
+| `read_set` + `_validate` | Reads the set through Conformance's published contract and **refuses** a shape it does not fully understand, so coverage cannot shrink quietly |
+| `set-members-available` · `set-currency` | Turn set rot from something discovered by six red CI cells into something reported before work starts, per channel |
+| `constitution-pinned` | Makes the normative half of the set a checked field rather than prose in a comment |
 | the report envelope | Lets a machine consume readiness, so the human is not the integration point |
-| the daily head (unbuilt) | Removes the hand-bump that is currently the only thing advancing the floor |
+| the daily head (unbuilt) | Removes the hand-bump that is currently the only thing advancing the set |
 
 ## 4. Dependencies & gating
 
