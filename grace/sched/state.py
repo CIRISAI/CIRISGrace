@@ -190,7 +190,7 @@ def unreserve(d: Path) -> None:
     event(d, "unreserved")
 
 
-def history(d: Path, kind: str) -> List[float]:
+def history(d: Path, kind: str, need_only: bool = False) -> List[float]:
     """This kind's measured peaks, oldest first. A malformed record (an append
     cut short) is skipped on its own: stopping at it would hide every later
     measurement from admission for good."""
@@ -202,7 +202,13 @@ def history(d: Path, kind: str) -> List[float]:
     for line in lines:
         try:
             rec = json.loads(line)
-            if isinstance(rec, dict) and rec.get("kind") == kind and rec.get("peak_gb"):
+            if not (isinstance(rec, dict) and rec.get("kind") == kind):
+                continue
+            # A run's NEED (its anonymous memory) when it was measured; older
+            # records carry only memory.peak, which also counts page cache.
+            if rec.get("need_gb") is not None:
+                out.append(float(rec["need_gb"]))
+            elif not need_only and rec.get("peak_gb"):
                 out.append(float(rec["peak_gb"]))
         except (ValueError, TypeError):
             continue
