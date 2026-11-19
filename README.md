@@ -43,6 +43,46 @@ Exit code is 0 only when every gate passed.
 | `wire-vocabulary-pinned` | Is the CEG wire-vocabulary version pinned? — **not implemented** |
 | `head-advance` | Is there a newer coherent set than the one on main? — **not implemented** |
 
+## The build scheduler (`grace sched`)
+
+The shared build box runs many sessions' Rust builds on 31 GB. `grace sched`
+admits each job only when the box can take it, runs it inside its own capped
+scope, measures what it really used, and releases it when it exits.
+
+```bash
+python -m grace.sched run --owner edge --kind "edge check" --peak 6 -- cargo check --all-targets
+python -m grace.sched run --priority critical --owner server -- cargo test --test drive_crud
+python -m grace.sched status            # who runs, who waits, and why
+python -m grace.sched doctor            # stuck waiters, unscheduled builds, leaked legacy slots, disk
+python -m grace.sched reserve verify --minutes 20    # promise the heavy slot
+python -m grace.sched history --kind "edge check"   # measured peaks and durations
+bin/cargo_guard.sh cargo build ...      # drop-in for the legacy cargo_guard.sh
+```
+
+The rules, each from a real incident (see `grace/sched/policy.py`):
+
+| Rule | Why |
+|---|---|
+| A slot is a lease (pid + start time), not an open file | A child that inherited the legacy guard's flock held its slot for an hour |
+| Children start with no inherited descriptors | The same leak, closed at the source |
+| Admit on *projected* memory: available now minus the headroom running jobs still grow into | Granting on `free -g` overcommitted three jobs and the reaper killed one |
+| One heavy job (above 4 GB) at a time; light work fills in around it | Two heavy builds at once took whole terminal scopes |
+| An 8 GB floor stays free after every admitted peak | The agents, browsers and databases live there |
+| A disk floor (30 GB) | The disk filled to 75 MB and every session's writes failed |
+| Peaks are learned from the scope's own `memory.peak` | A 4.9 GB spike under a 4 GB grant slipped past a 1 s poll |
+| A cap kill is recorded at the cap | The next estimate learns the job needs more |
+| A timeout kills this job's own scope only | A watchdog's `pkill -f "cargo build --release"` killed every session's release build |
+| Priority (critical, normal, low), then first come; a reservation is kept | Critical-path work and promised slots |
+| A starving heavy job stops light backfill behind it | Fairness |
+| "Done" is the job exiting; every event goes to `events.jsonl` | Peers had to remember to report |
+| `status` names why each waiter waits; `doctor` flags a wait with no reason | A session waited 10 min on a free box |
+| Builds under the legacy guard count as running at their own cap | It stays safe while sessions migrate |
+
+State lives in `/tmp/grace-sched-<uid>` (`$GRACE_SCHED_DIR`): plain JSON you can
+`cat`. Knobs: `GRACE_SCHED_FLOOR_GB`, `GRACE_SCHED_HEAVY_GB`,
+`GRACE_SCHED_DISK_FLOOR_GB`, `GRACE_SCHED_MAX_RUNNING`, `GRACE_SCHED_STARVE_SECS`.
+Defaults for a build: `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=2`.
+
 ## Where the set comes from
 
 Grace does **not** parse `matrices/current.yaml`. That file's shape belongs to

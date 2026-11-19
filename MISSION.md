@@ -70,6 +70,7 @@ access is opt-out via `--offline` so the tool still answers on a train.
 | `set-members-available` · `set-currency` | Turn set rot from something discovered by six red CI cells into something reported before work starts, per channel |
 | `constitution-pinned` | Makes the normative half of the set a checked field rather than prose in a comment |
 | the report envelope | Lets a machine consume readiness, so the human is not the integration point |
+| `grace sched` (the build scheduler) | Turns the shared box's capacity from a negotiation between sessions, where each lesson was learned by an OOM, a full disk or a killed build, into a checked rule that names why a job waits; the box's state is a command, not one coordinator's memory |
 | the daily head (unbuilt) | Removes the hand-bump that is currently the only thing advancing the set |
 
 ## 4. Dependencies & gating
