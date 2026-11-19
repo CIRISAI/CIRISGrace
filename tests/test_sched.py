@@ -117,6 +117,17 @@ class Policy(unittest.TestCase):
         self.assertEqual(reason_gist("behind e:k, which has waited 31 min; nothing passes it now"),
                          reason_gist("behind e:k, which has waited 32 min; nothing passes it now"))
 
+    def test_a_job_too_big_for_any_cap_is_refused_on_measured_need_only(self):
+        # Codex on #3: a job whose estimate is above any cap would be killed at it.
+        from grace.sched import runner
+        self.assertIn("measured need", runner.too_big_for_box(None, 16.1, [14.0], None))
+        self.assertIn("declared peak", runner.too_big_for_box(20.0, 20.0, [], None))
+        self.assertIsNone(runner.too_big_for_box(None, 16.1, [14.0], 16.0), "an explicit --cap is the caller's")
+        # Old records carry only memory.peak (page cache included): they never refuse
+        # a build that reached the cap through cache and finished cleanly.
+        self.assertIsNone(runner.too_big_for_box(None, 16.1, [], None))
+        self.assertIsNone(runner.too_big_for_box(None, 9.0, [8.0], None))
+
     def test_a_measured_spike_raises_a_low_declaration(self):
         # 2026-11-19: a "4 GB" job spiked to 4.9 GB, which a 1 s poll missed.
         peak, src = pol.estimate_peak(4.0, [4.9])
@@ -209,6 +220,13 @@ class State(unittest.TestCase):
         self.assertIsNone(got["cargo-guard-1.scope"]["cap_gb"])
         self.assertTrue(got["cargo-guard-1.scope"]["uncapped"])
         self.assertEqual(got["cargo-guard-2.scope"]["cap_gb"], 4.0)
+
+    def test_history_learns_need_and_old_records_count_only_when_asked(self):
+        with state.locked() as d:
+            state.record(d, kind="k", peak_gb=16.0)              # before need was measured
+            state.record(d, kind="k", peak_gb=14.0, need_gb=5.5)  # memory.peak counted cache
+            self.assertEqual(state.history(d, "k"), [16.0, 5.5])
+            self.assertEqual(state.history(d, "k", need_only=True), [5.5])
 
     def test_a_recycled_pid_is_not_the_holder(self):
         with state.locked() as d:
@@ -392,6 +410,29 @@ class Run(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             kind = self._last_history()["kind"]
             self.assertTrue(kind.endswith(": true check --lib"), (wrapped, kind))
+
+    def test_a_declared_peak_above_any_cap_is_refused_before_it_runs(self):
+        r = self.sched("run", "--peak", "20", "--", sys.executable, "-c", "print('RAN')")
+        self.assertEqual(r.returncode, 79, r.stderr)
+        self.assertNotIn("RAN", r.stdout)
+        self.assertIn("declared peak 20 GB", r.stderr)
+
+    @unittest.skipUnless(probe.systemd_scopes_usable(), "needs systemd user scopes")
+    def test_page_cache_is_not_learned_as_need(self):
+        # Codex on #3: memory.peak counts page cache the kernel reclaims at the
+        # cap; learning from it ratcheted a working build's estimate past the cap.
+        env = {k: v for k, v in self.env.items() if k not in ("GRACE_SCHED_NO_SYSTEMD", "GRACE_SCHED_ALLOW_UNCAPPED")}
+        target = Path(self.tmp.name, "cache.bin")
+        write = (f"f=open({str(target)!r},'wb')\n"
+                 "for _ in range(48): f.write(b'x'*(8*1024*1024))\n"
+                 "f.flush(); f.close()")
+        r = subprocess.run([sys.executable, "-m", "grace.sched", "run", "--kind", "cachewriter", "--peak", "1",
+                            "--", sys.executable, "-c", write],
+                           env=env, capture_output=True, text=True, cwd=str(ROOT), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rec = json.loads(Path(self.tmp.name, "history.jsonl").read_text().splitlines()[-1])
+        self.assertGreater(rec["peak_gb"], 0.2, "memory.peak saw the written pages")
+        self.assertLess(rec["need_gb"], 0.2, "need is the anonymous memory only")
 
     def test_status_shows_a_waiter_and_why(self):
         # A held heavy lease (this test process), then a heavy request waits.

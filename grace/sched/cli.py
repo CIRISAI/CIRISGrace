@@ -9,7 +9,8 @@
 
 Exit codes for `run`: the job's own, 75 when it waited too long, 77 for
 usage, 78 when no hard memory cap can be applied or the state directory is
-not private, 124 for its own timeout. A job killed at its memory cap exits 137.
+not private, 79 when the job needs more than any cap this box gives, 124 for
+its own timeout. A job killed at its memory cap exits 137.
 """
 
 from __future__ import annotations
@@ -146,7 +147,8 @@ def cmd_history(a) -> int:
         pass
     for r in rows[-a.last:]:
         flag = " OOM" if r.get("oom_killed") else (" TIMEOUT" if r.get("timed_out") else "")
-        print(f"{r.get('at', '')}  {r.get('owner')}:{r.get('kind')}  peak {r.get('peak_gb')} GB "
+        need = f"need {r['need_gb']} GB, " if r.get("need_gb") is not None else ""
+        print(f"{r.get('at', '')}  {r.get('owner')}:{r.get('kind')}  {need}memory.peak {r.get('peak_gb')} GB "
               f"(est {r.get('peak_estimate_gb')})  {r.get('secs')} s  rc {r.get('rc')}{flag}")
     return 0
 

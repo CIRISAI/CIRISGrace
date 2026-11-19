@@ -20,6 +20,9 @@ release.
   The job runs as a child of this process, not ``exec``'d, so this process
   can sample it and release the lease when it exits. Nobody has to remember
   to report "done".
+- **Learning** records the job's NEED, the most anonymous memory it held
+  (sampled every 0.2 s), and learns the next estimate from it. ``memory.peak``
+  is kept as a diagnostic: it counts page cache the kernel reclaims at the cap.
 - **Measuring** polls the scope's own ``memory.peak``, the kernel's running
   maximum, so a spike that came and went between two polls is still counted
   (2026-11-19: a 4.9 GB conversion spike under a 4 GB grant slipped past a
@@ -52,6 +55,7 @@ from . import probe, state
 EXIT_WAITED_TOO_LONG = 75
 EXIT_USAGE = 77
 EXIT_NO_CAP = 78
+EXIT_TOO_BIG = 79
 
 
 def _say(msg: str) -> None:
@@ -63,7 +67,11 @@ def running_view(d) -> List[pol.Running]:
     for v in state.entries(d, "leases"):
         used = None
         if v.get("cgroup"):
-            used = probe.cgroup_gb(v["cgroup"])
+            # What the job cannot give back: its anonymous memory. Page cache
+            # is already counted as available in MemAvailable.
+            used = probe.cgroup_anon_gb(v["cgroup"])
+            if used is None:
+                used = probe.cgroup_gb(v["cgroup"])
         if used is None and v.get("pgid"):
             used = probe.rss_gb_of_group(int(v["pgid"]))
         out.append(pol.Running(v["id"], v["owner"], v["kind"], float(v["peak_gb"]), float(used or 0.0),
@@ -145,6 +153,9 @@ def _job_env(extra: Dict[str, str]) -> Dict[str, str]:
 UNKNOWN_JOB_CAP_GB = 11.0
 
 
+#: The most memory this box caps one job at.
+MAX_CAP_GB = 14.0
+
 #: Runs of a kind before its learned peak may set an undeclared job's cap.
 LEARN_RUNS = 3
 
@@ -165,7 +176,7 @@ def default_cap(peak: float, source: str = "declared", runs: int = 0,
         declared = source.startswith("declared")
     if source.startswith("default") or (not declared and runs < LEARN_RUNS):
         return UNKNOWN_JOB_CAP_GB
-    return round(min(max(peak * 1.5, peak + 2.0), 14.0), 1)
+    return round(min(max(peak * 1.5, peak + 2.0), MAX_CAP_GB), 1)
 
 
 def plan(declared_gb: Optional[float], history_gb: List[float],
@@ -185,6 +196,27 @@ def plan(declared_gb: Optional[float], history_gb: List[float],
         peak = pol.UNKNOWN_PEAK_GB
         source += f", warming up ({LEARN_RUNS} runs to learn): admitted as an unknown job"
     return peak, source, cap
+
+
+def too_big_for_box(declared_gb: Optional[float], need_gb: float, need_history: List[float],
+                    cap_gb: Optional[float]) -> Optional[str]:
+    """Why a job cannot run under any cap this box gives, or None.
+
+    A job whose declared peak, or whose measured need (its anonymous memory,
+    which the kernel cannot reclaim), is above MAX_CAP_GB would be killed at
+    its cap; it is refused before it starts instead (Codex on #3). Only
+    measured need counts: `memory.peak` includes page cache, which the kernel
+    reclaims at the cap, and a build that reached 14 GB that way finished
+    cleanly (edge's `cargo test --no-fail-fast`, 2026-11-19). An explicit
+    --cap is the caller's own choice and is not second-guessed."""
+    if cap_gb:
+        return None
+    if declared_gb is not None and declared_gb > MAX_CAP_GB:
+        return f"declared peak {declared_gb:g} GB is above the {MAX_CAP_GB:g} GB this box caps a job at"
+    if need_history and need_gb > MAX_CAP_GB:
+        return (f"this kind's measured need ({need_gb:g} GB, from {len(need_history)} runs) is above the "
+                f"{MAX_CAP_GB:g} GB this box caps a job at")
+    return None
 
 
 def hold_legacy_slots() -> List[int]:
@@ -230,6 +262,11 @@ def run(argv: List[str], owner: str, kind: str, declared_gb: Optional[float],
     job_id = state.new_id()
     with state.locked() as d:
         peak, source, cap = plan(declared_gb, state.history(d, kind), cap_gb)
+        need = pol.estimate_peak(declared_gb, state.history(d, kind, need_only=True))[0]
+        too_big = too_big_for_box(declared_gb, need, state.history(d, kind, need_only=True), cap_gb)
+        if too_big:
+            _say(f"{too_big}; refusing ({EXIT_TOO_BIG}). Pass --cap to run it at a cap you choose.")
+            return EXIT_TOO_BIG
         me = os.getpid()
         req = {"id": job_id, "owner": owner, "kind": kind, "peak_gb": peak, "peak_source": source,
                "cap_gb": cap, "scoped": scoped,
@@ -329,6 +366,7 @@ def _execute(job_id: str, req: Dict, argv: List[str], cap: float, timeout_secs: 
         signal.signal(s, forward)
 
     peak_seen = 0.0
+    need_seen = 0.0
     oom_seen = 0
     timed_out = False
     polled_cap_kill = False
@@ -338,9 +376,11 @@ def _execute(job_id: str, req: Dict, argv: List[str], cap: float, timeout_secs: 
         # scope vanishes when the job exits, so it is read while it lives.
         if cgroup:
             used = probe.cgroup_gb(cgroup, "memory.peak") or probe.cgroup_gb(cgroup)
+            need_seen = max(need_seen, probe.cgroup_anon_gb(cgroup) or 0.0)
             oom_seen = max(oom_seen, probe.oom_kills(cgroup))
         else:
             used = probe.rss_gb_of_group(child.pid)
+            need_seen = max(need_seen, used)
             if used > cap and not polled_cap_kill:
                 polled_cap_kill = True
                 _say(f"{job_id} passed its {cap:.1f} GB cap ({used:.2f} GB RSS): killing its own process group")
@@ -372,10 +412,16 @@ def _execute(job_id: str, req: Dict, argv: List[str], cap: float, timeout_secs: 
         # It reached at least the cap, whatever the last poll saw, and the
         # next estimate must learn that.
         peak_gb = max(peak_gb, round(cap, 2))
+        need_seen = max(need_seen, cap)
+    # What the next estimate learns: the anonymous memory the job really held.
+    # `memory.peak` (kept as peak_gb, a diagnostic) also counts page cache,
+    # which the kernel reclaims at the cap, and learning from it ratcheted a
+    # working build's estimate past the cap (Codex on #3).
+    need_gb = round(need_seen, 2)
     secs = round(time.time() - started)
     with state.locked() as d:
         state.drop(d, "leases", job_id)
-        state.record(d, kind=req["kind"], owner=req["owner"], peak_gb=peak_gb, secs=secs, rc=rc,
+        state.record(d, kind=req["kind"], owner=req["owner"], peak_gb=peak_gb, need_gb=need_gb, secs=secs, rc=rc,
                      oom_killed=oom, timed_out=timed_out, cap_gb=round(cap, 1),
                      peak_estimate_gb=req["peak_gb"], at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
         state.event(d, "finished", id=job_id, owner=req["owner"], kind=req["kind"], rc=rc,
@@ -383,5 +429,6 @@ def _execute(job_id: str, req: Dict, argv: List[str], cap: float, timeout_secs: 
                     oom_killed=oom, timed_out=timed_out)
     note = " (killed at its memory cap)" if oom else (" (killed by SIGKILL from outside: not a cap kill)"
                                                      if killed else "")
-    _say(f"{job_id} done: rc {rc}{note}, {secs} s, peak {peak_gb:g} GB (estimate {req['peak_gb']:g})")
+    _say(f"{job_id} done: rc {rc}{note}, {secs} s, need {need_gb:g} GB (memory.peak {peak_gb:g}, "
+         f"estimate {req['peak_gb']:g})")
     return 124 if timed_out else (rc if rc >= 0 else 128 - rc)
