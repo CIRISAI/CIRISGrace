@@ -37,6 +37,11 @@
 - A PR that adds or changes a gate updates `MISSION.md` §3 and the README gate table in the same commit. A gate whose question changed without `MISSION.md` changing is mission drift.
 - When a gate's failure is caused by an upstream obligation, add a row to `evidence/blocked_upstream.tsv` with a scannable predicate rather than a prose note.
 
+## The build scheduler (`grace/sched/`)
+- The one Grace component that RUNS something: the command its caller hands it, inside a capped systemd scope. It never starts, stops or edits anything else, the caller's own unit included. It refuses to run a job it cannot hard-cap (exit 78) unless `GRACE_SCHED_ALLOW_UNCAPPED=1`, and admission reserves each job's cap, not its estimate. Its timeout kills its own scope only; it never matches processes by name.
+- Admission rules live in `policy.py` as pure functions with one unit test per rule (`tests/test_sched.py`); a new rule comes with the incident that taught it.
+- State is plain JSON under `$GRACE_SCHED_DIR`. The mutex is held for milliseconds, never across a job.
+
 ## Security & Configuration Tips
 - No credentials in this repo. `gh` supplies GitHub auth; PyPI reads are anonymous.
 - Never write to a sibling checkout. Grace reports; humans and CI act.
