@@ -122,8 +122,10 @@ def tick(d) -> pol.Decision:
 
 def reason_gist(why: str) -> str:
     """A wait reason with its live figures blanked, so a waiter says why once per
-    reason rather than once per poll."""
-    return re.sub(r"\d+(\.\d+)?", "#", why)
+    reason rather than once per poll. Only figures are blanked (a number
+    standing alone before GB, min or jobs); digits inside a name (an owner
+    ``team2``, a kind ``persist v61``) stay, so a change of blocker is said."""
+    return re.sub(r"(?<![\w.])\d+(?:\.\d+)?(?=\s*(?:GB|min|jobs)\b)", "#", why)
 
 
 def _job_env(extra: Dict[str, str]) -> Dict[str, str]:

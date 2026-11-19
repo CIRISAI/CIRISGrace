@@ -109,6 +109,13 @@ class Policy(unittest.TestCase):
         b = "memory: needs 9.0 GB plus the 8 GB floor, 13.7 GB projected free once running jobs reach their peaks"
         self.assertEqual(reason_gist(a), reason_gist(b))
         self.assertNotEqual(reason_gist(a), reason_gist("one heavy job at a time: edge:check holds it"))
+        # Codex on #5: digits in a name are not a live figure.
+        self.assertNotEqual(reason_gist("the heavy slot is promised to team2"),
+                            reason_gist("the heavy slot is promised to team3"))
+        self.assertNotEqual(reason_gist("one heavy job at a time: p:persist v61 build holds it"),
+                            reason_gist("one heavy job at a time: p:persist v62 build holds it"))
+        self.assertEqual(reason_gist("behind e:k, which has waited 31 min; nothing passes it now"),
+                         reason_gist("behind e:k, which has waited 32 min; nothing passes it now"))
 
     def test_a_measured_spike_raises_a_low_declaration(self):
         # 2026-11-19: a "4 GB" job spiked to 4.9 GB, which a 1 s poll missed.
