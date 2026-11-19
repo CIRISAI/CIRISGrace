@@ -125,8 +125,42 @@ def _job_env(extra: Dict[str, str]) -> Dict[str, str]:
     return env
 
 
-def default_cap(peak: float) -> float:
+#: The legacy cargo_guard.sh's cap with its default two slots. A job this
+#: scheduler knows nothing about (no declaration, no history) keeps it, so a
+#: build that fitted under the old guard is not killed on its first run here.
+UNKNOWN_JOB_CAP_GB = 11.0
+
+
+def default_cap(peak: float, source: str = "declared") -> float:
+    if source.startswith("default"):
+        return UNKNOWN_JOB_CAP_GB
     return round(min(max(peak * 1.5, peak + 2.0), 14.0), 1)
+
+
+def hold_legacy_slots() -> List[int]:
+    """While sessions migrate, a heavy job here also takes every FREE slot
+    lock of the legacy cargo_guard.sh, so a session still on an old copy
+    waits instead of starting a second heavy build beside this one. Held by
+    this supervisor only (the job inherits nothing: close_fds), so they are
+    released when it exits, even if it is killed."""
+    if os.environ.get("GRACE_SCHED_HOLD_LEGACY_SLOTS", "1") != "1":
+        return []
+    import fcntl
+    base = os.environ.get("GRACE_SCHED_LEGACY_LOCK", "/tmp/cargo_guard.lock")
+    held = []
+    for path in [base] + [f"{base}.{n}" for n in range(1, 4)]:
+        if not os.path.exists(path):
+            continue
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held.append(fd)
+        except OSError:
+            os.close(fd)
+    return held
 
 
 def run(argv: List[str], owner: str, kind: str, declared_gb: Optional[float],
@@ -146,7 +180,7 @@ def run(argv: List[str], owner: str, kind: str, declared_gb: Optional[float],
     job_id = state.new_id()
     with state.locked() as d:
         peak, source = pol.estimate_peak(declared_gb, state.history(d, kind))
-        cap = round(cap_gb, 1) if cap_gb else default_cap(peak)
+        cap = round(cap_gb, 1) if cap_gb else default_cap(peak, source)
         me = os.getpid()
         req = {"id": job_id, "owner": owner, "kind": kind, "peak_gb": peak, "peak_source": source,
                "cap_gb": cap, "scoped": scoped,
@@ -185,7 +219,12 @@ def run(argv: List[str], owner: str, kind: str, declared_gb: Optional[float],
             state.drop(d, "queue", job_id)
         return 130
 
-    return _execute(job_id, req, argv, cap, timeout_secs, t0, scoped)
+    legacy = hold_legacy_slots() if peak > policy_from_env().heavy_gb else []
+    try:
+        return _execute(job_id, req, argv, cap, timeout_secs, t0, scoped)
+    finally:
+        for fd in legacy:
+            os.close(fd)
 
 
 def _record_job(job_id: str, **fields) -> None:

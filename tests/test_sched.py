@@ -263,6 +263,29 @@ class Run(unittest.TestCase):
         unit = "grace-sched-" + json.loads(Path(self.tmp.name, "events.jsonl").read_text().splitlines()[0])["id"]
         self.assertEqual(probe.unit_result(unit + ".scope"), "success", "its own failed unit is reset")
 
+    def test_an_unknown_job_keeps_the_legacy_guards_cap(self):
+        from grace.sched import runner
+        self.assertEqual(runner.default_cap(6.0, "default (no declaration, no history)"), 11.0)
+        self.assertEqual(runner.default_cap(2.0, "declared"), 4.0)
+        self.assertEqual(runner.default_cap(12.0, "learned (3 runs)"), 14.0)
+
+    def test_a_heavy_job_holds_the_legacy_guards_free_slots(self):
+        import fcntl
+        lock = Path(self.tmp.name, "legacy.lock")
+        lock.touch()
+        Path(f"{lock}.1").touch()
+        probe_cmd = ("import fcntl,os,sys\nfor p in sys.argv[1:]:\n fd=os.open(p,os.O_RDWR)\n try:\n"
+                     "  fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB); print('FREE',p)\n except OSError: print('HELD',p)")
+        env = {**self.env, "GRACE_SCHED_LEGACY_LOCK": str(lock), "GRACE_SCHED_HEAVY_GB": "0.01"}
+        r = subprocess.run([sys.executable, "-m", "grace.sched", "run", "--peak", "0.05", "--",
+                            sys.executable, "-c", probe_cmd, str(lock), f"{lock}.1"],
+                           env=env, capture_output=True, text=True, cwd=str(ROOT))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.count("HELD"), 2, r.stdout)
+        fd = os.open(lock, os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released once the job is done
+        os.close(fd)
+
     def test_status_shows_a_waiter_and_why(self):
         # A held heavy lease (this test process), then a heavy request waits.
         with_env = dict(os.environ)

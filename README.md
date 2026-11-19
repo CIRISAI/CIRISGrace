@@ -82,6 +82,8 @@ The rules, each from a real incident (see `grace/sched/policy.py`):
 | A cap kill needs the kernel's word (`memory.events` or `Result=oom-kill`) | An outside SIGKILL recorded as a cap kill inflated the next estimate |
 | A lease outlives a dead supervisor while its job still runs | Reclaiming it hid a live build from admission |
 | The scheduler changes nothing outside its job's scope | It once marked the caller's whole unit OOM-avoid |
+| A job with no declaration and no history keeps the legacy guard's 11 GB cap | A build that fitted under the old guard must not die on its first run here |
+| While sessions migrate, a heavy job also holds the legacy guard's free slot locks | An old copy of the guard cannot see this scheduler's jobs |
 
 State lives in `/run/user/<uid>/grace-sched` (else `/tmp/grace-sched-<uid>`; `$GRACE_SCHED_DIR` overrides), refused unless it is a real directory owned by you and closed to others: plain JSON you can
 `cat`. Knobs: `GRACE_SCHED_FLOOR_GB`, `GRACE_SCHED_HEAVY_GB`,
