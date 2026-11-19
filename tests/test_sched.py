@@ -83,15 +83,28 @@ class Policy(unittest.TestCase):
                 self.assertTrue(d.waits.get(r.id), f"{r.id} waits with no reason")
 
     def test_admission_reserves_the_cap_not_the_estimate(self):
-        # Codex on #3: a 2 GB estimate with a 4 GB cap may grow to 4 GB.
+        # Codex on #3: a 2 GB estimate with a 4 GB cap may grow to 4 GB, so the
+        # cap must fit in what is projected free (the worst case).
+        tight = pol.Request("t", "t", "t-kind", 2.0, budget_gb=12.0)
+        d = pol.decide([tight], [], pol.Machine(11, BIG_DISK), P)
+        self.assertEqual(d.start, [], "2 + 8 fits, but its 12 GB cap does not")
+        self.assertIn("for its cap", d.waits["t"])
         light = pol.Request("l", "l", "l-kind", 2.0, budget_gb=4.0)
-        d = pol.decide([light], [], pol.Machine(11, BIG_DISK), P)
-        self.assertEqual(d.start, [], "2 + 8 fits, but its 4 GB cap + 8 does not")
-        self.assertIn("its cap", d.waits["l"])
-        self.assertEqual(pol.decide([light], [], pol.Machine(12, BIG_DISK), P).start, ["l"])
+        self.assertEqual(pol.decide([light], [], pol.Machine(11, BIG_DISK), P).start, ["l"])
         self.assertFalse(light.heavy(P), "heavy or light is still judged on the estimate")
         running = [pol.Running("r", "o", "k", peak_gb=2, used_gb=2, budget_gb=5)]
         self.assertEqual(pol.projected(pol.Machine(20, BIG_DISK), running), 17)
+
+    def test_an_empty_box_admits_a_job_whose_cap_fits_and_whose_peak_leaves_the_floor(self):
+        # 2026-11-19: with nothing running and 15.3 GB free, an 11 GB cap was held
+        # for 11 + 8 = 19 GB and the whole queue stalled. The floor protects the
+        # expected peak; the cap only has to fit.
+        verify = pol.Request("v", "verify", "cargo test", 6.0, budget_gb=11.0)
+        self.assertEqual(pol.decide([verify], [], pol.Machine(15.3, BIG_DISK), P).start, ["v"])
+        big = pol.Request("b", "persist", "nextest", 9.0, budget_gb=13.5)
+        d = pol.decide([big], [], pol.Machine(15.3, BIG_DISK), P)
+        self.assertEqual(d.start, [], "9 + 8 = 17 GB is more than 15.3 free")
+        self.assertIn("expected peak", d.waits["b"])
 
     def test_nothing_starts_beside_an_uncapped_job(self):
         # Codex on #3: a legacy scope with memory.max "max" was counted as a
@@ -351,7 +364,7 @@ class Run(unittest.TestCase):
 
     def _seed(self, kind, *peaks):
         for pk in peaks:
-            state.record(Path(self.tmp.name), kind=kind, peak_gb=pk)
+            state.record(Path(self.tmp.name), kind=kind, peak_gb=pk, need_gb=pk)
 
     def test_a_declared_job_above_its_declaration_keeps_the_calculated_cap(self):
         # Codex on #6: a declared 8 GB job with a 9 GB run behind it got the
