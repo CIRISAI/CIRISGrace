@@ -202,6 +202,18 @@ def plan(declared_gb: Optional[float], history_gb: List[float],
     return peak, source, cap
 
 
+def learning_history(declared_gb: Optional[float], d, kind: str) -> List[float]:
+    """The history an estimate learns from. Runs measured by need (anonymous
+    memory) always count. Older runs carry only memory.peak, which counts page
+    cache: they count for an undeclared job, which has nothing better, but they
+    do not override a declaration (persist's declared 9 GB lib lane was held
+    at a 14.3 GB estimate learned from memory.peak, 2026-11-19)."""
+    need = state.history(d, kind, need_only=True)
+    if need or declared_gb is not None:
+        return need
+    return state.history(d, kind)
+
+
 def too_big_for_box(declared_gb: Optional[float], need_gb: float, need_history: List[float],
                     cap_gb: Optional[float]) -> Optional[str]:
     """Why a job cannot run under any cap this box gives, or None.
@@ -265,7 +277,7 @@ def run(argv: List[str], owner: str, kind: str, declared_gb: Optional[float],
         return EXIT_NO_CAP
     job_id = state.new_id()
     with state.locked() as d:
-        peak, source, cap = plan(declared_gb, state.history(d, kind), cap_gb)
+        peak, source, cap = plan(declared_gb, learning_history(declared_gb, d, kind), cap_gb)
         need = pol.estimate_peak(declared_gb, state.history(d, kind, need_only=True))[0]
         too_big = too_big_for_box(declared_gb, need, state.history(d, kind, need_only=True), cap_gb)
         if too_big:

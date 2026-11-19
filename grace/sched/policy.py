@@ -13,7 +13,8 @@ named where it is enforced:
   minus what it uses now). Granting on ``free -g`` alone overcommitted three
   jobs and the low-memory reaper killed one at 92 %.
 - KEEP A FLOOR. Nothing starts unless ``floor_gb`` stays available after its
-  budget: the agents themselves, browsers and databases live in that floor.
+  expected peak, and its cap fits in what is free: the agents themselves,
+  browsers and databases live in that floor, and the cap is the worst case.
 - BUDGET THE CAP, NOT THE ESTIMATE. A job may grow to its hard memory cap
   before the kernel stops it, so admission reserves the cap (``budget_gb``).
   Reserving only the estimate let several light jobs, each under its own
@@ -164,10 +165,15 @@ def decide(
             if now - r.created >= policy.starve_secs:
                 head_starving = r
             continue
-        need = r.budget() + policy.floor_gb
+        # The cap must fit in what is projected free (the worst case: the job
+        # grows to its cap), and the EXPECTED peak must leave the floor. The
+        # floor on top of the cap asked a 14 GB job for 22 GB free on a 31 GB
+        # box, and an empty box admitted nothing (2026-11-19).
+        need = max(r.budget(), r.peak_gb + policy.floor_gb)
         if room < need:
             d.waits[r.id] = (
-                f"memory: needs {r.budget():.1f} GB (its cap) plus the {policy.floor_gb:.0f} GB floor, "
+                f"memory: needs {r.budget():.1f} GB for its cap and {r.peak_gb:.1f} GB plus the "
+                f"{policy.floor_gb:.0f} GB floor for its expected peak, "
                 f"{room:.1f} GB projected free once running jobs reach their peaks"
             )
             if heavy and now - r.created >= policy.starve_secs:
