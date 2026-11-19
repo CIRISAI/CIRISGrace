@@ -191,14 +191,21 @@ def unreserve(d: Path) -> None:
 
 
 def history(d: Path, kind: str) -> List[float]:
-    out = []
+    """This kind's measured peaks, oldest first. A malformed record (an append
+    cut short) is skipped on its own: stopping at it would hide every later
+    measurement from admission for good."""
     try:
-        for line in (d / "history.jsonl").read_text().splitlines():
+        lines = (d / "history.jsonl").read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
             rec = json.loads(line)
-            if rec.get("kind") == kind and rec.get("peak_gb"):
+            if isinstance(rec, dict) and rec.get("kind") == kind and rec.get("peak_gb"):
                 out.append(float(rec["peak_gb"]))
-    except (OSError, ValueError):
-        pass
+        except (ValueError, TypeError):
+            continue
     return out
 
 

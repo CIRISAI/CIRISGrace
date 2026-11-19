@@ -93,6 +93,14 @@ class Policy(unittest.TestCase):
         running = [pol.Running("r", "o", "k", peak_gb=2, used_gb=2, budget_gb=5)]
         self.assertEqual(pol.projected(pol.Machine(20, BIG_DISK), running), 17)
 
+    def test_nothing_starts_beside_an_uncapped_job(self):
+        # Codex on #3: a legacy scope with memory.max "max" was counted as a
+        # 14 GB job, though nothing stops it growing past that.
+        free = pol.Running("cargo-guard-1.scope", "legacy", "k", peak_gb=3, used_gb=3, uncapped=True)
+        d = pol.decide([req("a", 0.5)], [free], pol.Machine(28, BIG_DISK), P)
+        self.assertEqual(d.start, [])
+        self.assertIn("no memory cap", d.waits["a"])
+
     def test_a_waiter_says_why_once_per_reason_not_per_poll(self):
         # 2026-11-19: the projected-GB figure changed every 3 s poll, and each
         # change printed another "waits:" line (over 100 for one cargo fmt).
@@ -101,6 +109,13 @@ class Policy(unittest.TestCase):
         b = "memory: needs 9.0 GB plus the 8 GB floor, 13.7 GB projected free once running jobs reach their peaks"
         self.assertEqual(reason_gist(a), reason_gist(b))
         self.assertNotEqual(reason_gist(a), reason_gist("one heavy job at a time: edge:check holds it"))
+        # Codex on #5: digits in a name are not a live figure.
+        self.assertNotEqual(reason_gist("the heavy slot is promised to team2"),
+                            reason_gist("the heavy slot is promised to team3"))
+        self.assertNotEqual(reason_gist("one heavy job at a time: p:persist v61 build holds it"),
+                            reason_gist("one heavy job at a time: p:persist v62 build holds it"))
+        self.assertEqual(reason_gist("behind e:k, which has waited 31 min; nothing passes it now"),
+                         reason_gist("behind e:k, which has waited 32 min; nothing passes it now"))
 
     def test_a_measured_spike_raises_a_low_declaration(self):
         # 2026-11-19: a "4 GB" job spiked to 4.9 GB, which a 1 s poll missed.
@@ -173,6 +188,28 @@ class State(unittest.TestCase):
         state.root()
         self.assertEqual(target.stat().st_mode & 0o077, 0, "an open directory of ours is closed")
 
+    def test_a_torn_history_record_hides_no_later_run(self):
+        # Codex on #3: an interrupted append left a truncated line, and every
+        # measurement after it was ignored by admission.
+        d = Path(self.tmp.name)
+        state.record(d, kind="k", peak_gb=2.0)
+        with open(d / "history.jsonl", "a") as f:
+            f.write('{"kind": "k", "peak_g\n')
+        state.record(d, kind="k", peak_gb=9.0)
+        self.assertEqual(state.history(d, "k"), [2.0, 9.0])
+
+    def test_a_legacy_scope_without_a_limit_is_uncapped(self):
+        # Codex on #3: memory.max "max" is no limit (cgroup v2), not 14 GB.
+        base = Path(self.tmp.name)
+        for name, mx in (("cargo-guard-1.scope", "max"), ("cargo-guard-2.scope", str(4 * probe.GIB))):
+            (base / name).mkdir()
+            (base / name / "memory.max").write_text(mx + "\n")
+            (base / name / "memory.current").write_text(str(probe.GIB) + "\n")
+        got = {g["unit"]: g for g in probe.legacy_guard_scopes(base)}
+        self.assertIsNone(got["cargo-guard-1.scope"]["cap_gb"])
+        self.assertTrue(got["cargo-guard-1.scope"]["uncapped"])
+        self.assertEqual(got["cargo-guard-2.scope"]["cap_gb"], 4.0)
+
     def test_a_recycled_pid_is_not_the_holder(self):
         with state.locked() as d:
             state.put(d, "leases", {"id": "y", "owner": "o", "kind": "k", "peak_gb": 1,
@@ -188,6 +225,8 @@ class Run(unittest.TestCase):
         self.env = {**os.environ, "GRACE_SCHED_DIR": self.tmp.name, "GRACE_SCHED_NO_SYSTEMD": "1", "GRACE_SCHED_COUNT_LEGACY": "0",
                     "GRACE_SCHED_ALLOW_UNCAPPED": "1",
                     "GRACE_SCHED_FLOOR_GB": "0", "GRACE_SCHED_DISK_FLOOR_GB": "0",
+                    # a heavy test job must never take the box's real legacy slot locks
+                    "GRACE_SCHED_LEGACY_LOCK": str(Path(self.tmp.name, "no-legacy.lock")),
                     "PYTHONPATH": str(ROOT)}
 
     def tearDown(self):
@@ -289,6 +328,30 @@ class Run(unittest.TestCase):
         self.assertEqual(runner.default_cap(peak3, source3, runs=3), 10.2)
         self.assertEqual(runner.default_cap(2.0, "declared", runs=0), 4.0, "a declaration is believed at once")
 
+    def _seed(self, kind, *peaks):
+        for pk in peaks:
+            state.record(Path(self.tmp.name), kind=kind, peak_gb=pk)
+
+    def test_a_declared_job_above_its_declaration_keeps_the_calculated_cap(self):
+        # Codex on #6: a declared 8 GB job with a 9 GB run behind it got the
+        # 11 GB warm-up cap meant for undeclared jobs, not its 14 GB. Here at a
+        # smaller scale: declared 0.8, one 0.9 run, so its cap is 1.0 + 2.
+        self._seed("decl", 0.9)
+        r = self.sched("run", "--kind", "decl", "--peak", "0.8", "--wait", "60", "--", "true")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._last_history()["cap_gb"], 3.0, r.stderr)
+
+    def test_a_warming_kind_stays_in_the_heavy_slot(self):
+        # Codex on #6: one quiet run (0.02 GB) rounded the estimate to 0 GB, so
+        # the kind's next run, which may build, was admitted as light work.
+        self._seed("quiet", 0.02)
+        r = self.sched("run", "--kind", "quiet", "--cap", "0.5", "--wait", "60", "--", "true")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertGreater(self._last_history()["peak_estimate_gb"], pol.Policy().heavy_gb, r.stderr)
+        self._seed("quiet", 0.02, 0.02)
+        r = self.sched("run", "--kind", "quiet", "--cap", "0.5", "--wait", "60", "--", "true")
+        self.assertLess(self._last_history()["peak_estimate_gb"], 1.0, "after LEARN_RUNS runs it is learned")
+
     def test_a_heavy_job_holds_the_legacy_guards_free_slots(self):
         import fcntl
         lock = Path(self.tmp.name, "legacy.lock")
@@ -316,6 +379,19 @@ class Run(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         kind = self._last_history()["kind"]
         self.assertTrue(kind.endswith(": true check --lib"), kind)
+
+    def test_the_shim_skips_a_wrapper_options_separate_value(self):
+        # Codex on #4: `timeout -s TERM 300 cargo ...` took TERM for the command,
+        # so the kind carried the duration and learned nothing across runs.
+        for wrapped in (["timeout", "-s", "TERM", "300"], ["timeout", "--kill-after", "5", "60"],
+                        ["env", "-u", "FOO", "nice", "-n", "5"], ["stdbuf", "-o", "L"],
+                        ["taskset", "-c", "0-3"]):
+            r = subprocess.run([str(ROOT / "bin" / "cargo_guard.sh"), *wrapped, "true", "check", "--lib"],
+                               env={**self.env, "GRACE_SCHED_PEAK_GB": "0.1"}, capture_output=True, text=True,
+                               cwd=self.tmp.name)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            kind = self._last_history()["kind"]
+            self.assertTrue(kind.endswith(": true check --lib"), (wrapped, kind))
 
     def test_status_shows_a_waiter_and_why(self):
         # A held heavy lease (this test process), then a heavy request waits.

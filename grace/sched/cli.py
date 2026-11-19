@@ -58,7 +58,8 @@ def snapshot() -> Dict[str, Any]:
             for v in pol_order(queue)
         ],
         "starting_next": dec.start,
-        "legacy_guard_builds": [{"unit": r.id, "cap_gb": r.peak_gb, "used_gb": round(r.used_gb, 2)}
+        "legacy_guard_builds": [{"unit": r.id, "cap_gb": None if r.uncapped else r.peak_gb,
+                                 "used_gb": round(r.used_gb, 2)}
                                 for r in legacy],
     }
 
@@ -83,7 +84,8 @@ def cmd_status(a) -> int:
     for r in s["running"]:
         print(f"  {r['id']}  {r['owner']}:{r['kind']}  {r['for']}  using {r['used_gb']} of ~{r['peak_gb']} GB")
     for g in s["legacy_guard_builds"]:
-        print(f"  (legacy guard) {g['unit']}  using {g['used_gb']} of its {g['cap_gb']} GB cap")
+        cap = "no" if g["cap_gb"] is None else f"its {g['cap_gb']} GB"
+        print(f"  (legacy guard) {g['unit']}  using {g['used_gb']} GB, {cap} cap")
     print("waiting:" if s["waiting"] else "waiting: nobody")
     for w in s["waiting"]:
         print(f"  {w['id']}  {w['owner']}:{w['kind']}  [{w['priority']}]  {w['for']}  — {w['why']}")
