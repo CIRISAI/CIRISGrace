@@ -19,6 +19,9 @@ named where it is enforced:
   Reserving only the estimate let several light jobs, each under its own
   cap, together eat the floor. Heavy or light is still judged on the
   estimate.
+- NO ROOM IS KNOWN BESIDE AN UNCAPPED JOB. A running job with no memory
+  limit (a legacy scope whose ``memory.max`` is ``max``) may grow into all
+  the memory there is, so nothing starts until it ends.
 - DISK IS A RESOURCE. Below ``disk_floor_gb`` free, nothing starts: a full
   disk fails every session's writes at once.
 - PRIORITY, THEN FIFO; RESERVATIONS ARE KEPT. Critical-path work goes
@@ -74,6 +77,8 @@ class Running:
     used_gb: float = 0.0
     #: the job's hard cap, which it may grow into (default: the estimate)
     budget_gb: Optional[float] = None
+    #: no memory limit at all: it may grow into everything available
+    uncapped: bool = False
 
     def heavy(self, p: Policy) -> bool:
         return self.peak_gb > p.heavy_gb
@@ -127,6 +132,15 @@ def decide(
             d.waits[r.id] = (
                 f"disk: {machine.disk_free_gb:.0f} GB free, under the {policy.disk_floor_gb:.0f} GB "
                 "floor; free space (old target dirs) before anything starts"
+            )
+        return d
+
+    unbounded = next((r for r in running if r.uncapped), None)
+    if unbounded is not None:
+        for r in queue:
+            d.waits[r.id] = (
+                f"{unbounded.owner}:{unbounded.kind} runs with no memory cap, so no free memory can be "
+                "promised beside it; waiting until it ends"
             )
         return d
 

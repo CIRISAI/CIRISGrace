@@ -93,6 +93,14 @@ class Policy(unittest.TestCase):
         running = [pol.Running("r", "o", "k", peak_gb=2, used_gb=2, budget_gb=5)]
         self.assertEqual(pol.projected(pol.Machine(20, BIG_DISK), running), 17)
 
+    def test_nothing_starts_beside_an_uncapped_job(self):
+        # Codex on #3: a legacy scope with memory.max "max" was counted as a
+        # 14 GB job, though nothing stops it growing past that.
+        free = pol.Running("cargo-guard-1.scope", "legacy", "k", peak_gb=3, used_gb=3, uncapped=True)
+        d = pol.decide([req("a", 0.5)], [free], pol.Machine(28, BIG_DISK), P)
+        self.assertEqual(d.start, [])
+        self.assertIn("no memory cap", d.waits["a"])
+
     def test_a_waiter_says_why_once_per_reason_not_per_poll(self):
         # 2026-11-19: the projected-GB figure changed every 3 s poll, and each
         # change printed another "waits:" line (over 100 for one cargo fmt).
@@ -182,6 +190,18 @@ class State(unittest.TestCase):
             f.write('{"kind": "k", "peak_g\n')
         state.record(d, kind="k", peak_gb=9.0)
         self.assertEqual(state.history(d, "k"), [2.0, 9.0])
+
+    def test_a_legacy_scope_without_a_limit_is_uncapped(self):
+        # Codex on #3: memory.max "max" is no limit (cgroup v2), not 14 GB.
+        base = Path(self.tmp.name)
+        for name, mx in (("cargo-guard-1.scope", "max"), ("cargo-guard-2.scope", str(4 * probe.GIB))):
+            (base / name).mkdir()
+            (base / name / "memory.max").write_text(mx + "\n")
+            (base / name / "memory.current").write_text(str(probe.GIB) + "\n")
+        got = {g["unit"]: g for g in probe.legacy_guard_scopes(base)}
+        self.assertIsNone(got["cargo-guard-1.scope"]["cap_gb"])
+        self.assertTrue(got["cargo-guard-1.scope"]["uncapped"])
+        self.assertEqual(got["cargo-guard-2.scope"]["cap_gb"], 4.0)
 
     def test_a_recycled_pid_is_not_the_holder(self):
         with state.locked() as d:

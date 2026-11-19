@@ -172,20 +172,26 @@ def guard_of(cg: str) -> str:
     return "none"
 
 
-def legacy_guard_scopes() -> List[Dict[str, object]]:
+def legacy_guard_scopes(base: Optional[Path] = None) -> List[Dict[str, object]]:
     """The legacy cargo_guard.sh's live scopes, each with its MemoryMax and
     current use, so the projection counts builds that never asked this
-    scheduler (the migration period). A cap of "max" counts as 14 GB."""
-    base = Path(f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice")
-    out = []
+    scheduler (the migration period).
+
+    A ``memory.max`` of ``max`` means the kernel puts no limit on the scope,
+    so it is reported as uncapped (``cap_gb`` None), never as some fixed
+    figure: a build counted at 14 GB that grew past it would take memory a
+    job admitted beside it was promised."""
+    if base is None:
+        base = Path(f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice")
+    out: List[Dict[str, object]] = []
     for d in sorted(base.glob("cargo-guard-*.scope")):
         try:
             raw = (d / "memory.max").read_text().strip()
-            cap = 14.0 if raw == "max" else int(raw) / GIB
+            cap = None if raw == "max" else round(int(raw) / GIB, 1)
             used = int((d / "memory.current").read_text().split()[0]) / GIB
         except (OSError, ValueError):
             continue
-        out.append({"unit": d.name, "cap_gb": round(cap, 1), "used_gb": round(used, 2)})
+        out.append({"unit": d.name, "cap_gb": cap, "used_gb": round(used, 2), "uncapped": cap is None})
     return out
 
 

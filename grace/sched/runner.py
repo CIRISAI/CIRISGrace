@@ -73,8 +73,13 @@ def running_view(d) -> List[pol.Running]:
     # its own cap, until every session has moved over.
     if os.environ.get("GRACE_SCHED_COUNT_LEGACY", "1") == "1":
         for g in probe.legacy_guard_scopes():
-            out.append(pol.Running(str(g["unit"]), "legacy cargo_guard.sh", str(g["unit"]),
-                                   float(g["cap_gb"]), float(g["used_gb"])))
+            used = float(g["used_gb"])
+            if g["cap_gb"] is None:
+                out.append(pol.Running(str(g["unit"]), "legacy cargo_guard.sh", str(g["unit"]),
+                                       used, used, uncapped=True))
+            else:
+                out.append(pol.Running(str(g["unit"]), "legacy cargo_guard.sh", str(g["unit"]),
+                                       float(g["cap_gb"]), used))
     return out
 
 
