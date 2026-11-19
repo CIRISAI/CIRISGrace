@@ -345,6 +345,9 @@ class Run(unittest.TestCase):
         peak3, source3 = pol.estimate_peak(None, [0.02, 5.9, 5.8])
         self.assertEqual(runner.default_cap(peak3, source3, runs=3), 10.2)
         self.assertEqual(runner.default_cap(2.0, "declared", runs=0), 4.0, "a declaration is believed at once")
+        # The warm-up cap is a floor: a warming kind that already ran past it
+        # keeps the calculated cap (persist's nextest, 14.1 GB, killed at 11).
+        self.assertEqual(runner.default_cap(14.1, "learned (2 runs)", runs=2, declared=False), 14.0)
 
     def _seed(self, kind, *peaks):
         for pk in peaks:

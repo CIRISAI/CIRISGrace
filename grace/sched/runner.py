@@ -174,9 +174,13 @@ def default_cap(peak: float, source: str = "declared", runs: int = 0,
     "learned" source, and it keeps the calculated cap (Codex on #6)."""
     if declared is None:
         declared = source.startswith("declared")
+    calculated = round(min(max(peak * 1.5, peak + 2.0), MAX_CAP_GB), 1)
     if source.startswith("default") or (not declared and runs < LEARN_RUNS):
-        return UNKNOWN_JOB_CAP_GB
-    return round(min(max(peak * 1.5, peak + 2.0), MAX_CAP_GB), 1)
+        # The warm-up cap is a floor, never a ceiling: a kind still warming up
+        # whose runs already reached past it keeps the calculated cap (persist's
+        # nextest, estimate 14.1 GB, was killed at 11 GB, 2026-11-19).
+        return max(UNKNOWN_JOB_CAP_GB, calculated)
+    return calculated
 
 
 def plan(declared_gb: Optional[float], history_gb: List[float],
