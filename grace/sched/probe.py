@@ -187,3 +187,61 @@ def legacy_guard_scopes() -> List[Dict[str, object]]:
             continue
         out.append({"unit": d.name, "cap_gb": round(cap, 1), "used_gb": round(used, 2)})
     return out
+
+
+def cgroup_populated(rel: str) -> bool:
+    """Whether any process still lives in the cgroup (``cgroup.events``)."""
+    try:
+        for line in (cgroup_path(rel) / "cgroup.events").read_text().splitlines():
+            if line.startswith("populated "):
+                return line.split()[1] == "1"
+    except OSError:
+        return False
+    return False
+
+
+def group_alive(pgid: int) -> bool:
+    """Whether any process is still in the process group."""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def oom_kills(rel: str) -> int:
+    """The scope's own OOM kill count (``memory.events``): nonzero only when
+    the kernel killed inside this cgroup, at its own ``MemoryMax``."""
+    n = 0
+    try:
+        for line in (cgroup_path(rel) / "memory.events").read_text().splitlines():
+            k, _, v = line.partition(" ")
+            if k in ("oom_kill", "oom_group_kill"):
+                n += int(v)
+    except (OSError, ValueError):
+        return 0
+    return n
+
+
+def unit_result(unit: str) -> str:
+    """systemd's verdict on a finished unit of ours: ``oom-kill`` when the
+    kernel killed it at its cap. A failed scope stays loaded until reset."""
+    import subprocess
+    try:
+        r = subprocess.run(["systemctl", "--user", "show", unit, "-p", "Result", "--value"],
+                           capture_output=True, text=True, timeout=10, close_fds=True)
+        return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def reset_failed(unit: str) -> None:
+    """Unload our OWN finished unit, so failed scopes do not pile up."""
+    import subprocess
+    try:
+        subprocess.run(["systemctl", "--user", "reset-failed", unit], capture_output=True,
+                       timeout=10, close_fds=True)
+    except (OSError, subprocess.SubprocessError):
+        pass

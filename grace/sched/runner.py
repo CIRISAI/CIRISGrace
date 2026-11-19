@@ -9,8 +9,14 @@ release.
   ``grace-sched-<id>``, as the legacy guard did:
   - ``MemoryMax`` caps the job and ``MemorySwapMax=0`` stops it swapping;
   - ``memory.oom.group=1`` makes an OOM kill the whole job, never one rustc,
-    and never the terminal that launched it;
-  - the caller's own scope is marked ``ManagedOOMPreference=avoid``.
+    and never the terminal that launched it.
+  Nothing outside the job's own scope is changed, the caller's unit included.
+- **No cap, no run.** Admission reserves each job's cap, so a job without a
+  hard cap could outgrow what was reserved and exhaust the box. When systemd
+  user scopes are unavailable, ``run`` refuses (exit 78). Only with
+  ``GRACE_SCHED_ALLOW_UNCAPPED=1`` does it run the job uncapped, and then it
+  kills the job's own process group the moment its RSS passes the cap (a
+  polled cap, weaker than the kernel's).
   The job runs as a child of this process, not ``exec``'d, so this process
   can sample it and release the lease when it exits. Nobody has to remember
   to report "done".
@@ -20,6 +26,11 @@ release.
   one-second RSS poll). The scope vanishes when the job exits, so the peak is
   read while it lives. Live use is read from ``memory.current`` by every
   other waiter, for its projection.
+- **A cap kill is confirmed, not guessed.** Exit 137 alone could be an
+  operator's SIGKILL or the host's OOM killer. A kill counts as "at its cap"
+  only when the scope's own ``memory.events`` showed an OOM kill or systemd's
+  ``Result`` for the unit is ``oom-kill``; only then is the cap recorded as
+  the job's peak.
 - **Killing** on ``--timeout`` targets this job's own scope only. A watchdog
   that ran ``pkill -f "cargo build --release"`` killed every session's
   release build on the box (2026-11-18); nothing here matches by name.
@@ -39,6 +50,7 @@ from . import probe, state
 
 EXIT_WAITED_TOO_LONG = 75
 EXIT_USAGE = 77
+EXIT_NO_CAP = 78
 
 
 def _say(msg: str) -> None:
@@ -53,7 +65,8 @@ def running_view(d) -> List[pol.Running]:
             used = probe.cgroup_gb(v["cgroup"])
         if used is None and v.get("pgid"):
             used = probe.rss_gb_of_group(int(v["pgid"]))
-        out.append(pol.Running(v["id"], v["owner"], v["kind"], float(v["peak_gb"]), float(used or 0.0)))
+        out.append(pol.Running(v["id"], v["owner"], v["kind"], float(v["peak_gb"]), float(used or 0.0),
+                               budget_gb=float(v.get("cap_gb") or v["peak_gb"])))
     # Builds under the legacy cargo_guard.sh never asked this scheduler, but
     # they use the same memory. Each counts as a running job whose peak is
     # its own cap, until every session has moved over.
@@ -67,7 +80,7 @@ def running_view(d) -> List[pol.Running]:
 def queue_view(d) -> List[pol.Request]:
     return [
         pol.Request(v["id"], v["owner"], v["kind"], float(v["peak_gb"]), v.get("priority", "normal"),
-                    float(v.get("created", 0)))
+                    float(v.get("created", 0)), budget_gb=float(v.get("cap_gb") or v["peak_gb"]))
         for v in state.entries(d, "queue")
     ]
 
@@ -112,11 +125,8 @@ def _job_env(extra: Dict[str, str]) -> Dict[str, str]:
     return env
 
 
-def _shield_caller() -> None:
-    unit = (probe.cgroup_of(os.getpid()) or "").rstrip("/").rsplit("/", 1)[-1]
-    if unit.endswith((".scope", ".service")):
-        subprocess.run(["systemctl", "--user", "set-property", "--runtime", unit,
-                        "ManagedOOMPreference=avoid"], capture_output=True, close_fds=True)
+def default_cap(peak: float) -> float:
+    return round(min(max(peak * 1.5, peak + 2.0), 14.0), 1)
 
 
 def run(argv: List[str], owner: str, kind: str, declared_gb: Optional[float],
@@ -128,16 +138,23 @@ def run(argv: List[str], owner: str, kind: str, declared_gb: Optional[float],
     if priority not in pol.PRIORITIES:
         _say(f"priority must be one of {', '.join(pol.PRIORITIES)}")
         return EXIT_USAGE
+    scoped = probe.systemd_scopes_usable()
+    if not scoped and os.environ.get("GRACE_SCHED_ALLOW_UNCAPPED") != "1":
+        _say("systemd user scopes are unavailable, so no hard memory cap can be applied; refusing to run "
+             f"({EXIT_NO_CAP}). Set GRACE_SCHED_ALLOW_UNCAPPED=1 to run under a polled RSS cap instead.")
+        return EXIT_NO_CAP
     job_id = state.new_id()
     with state.locked() as d:
         peak, source = pol.estimate_peak(declared_gb, state.history(d, kind))
+        cap = round(cap_gb, 1) if cap_gb else default_cap(peak)
         me = os.getpid()
         req = {"id": job_id, "owner": owner, "kind": kind, "peak_gb": peak, "peak_source": source,
+               "cap_gb": cap, "scoped": scoped,
                "priority": priority, "created": time.time(), "pid": me,
                "pid_start": probe.start_time(me), "cmd": " ".join(argv)[:300], "cwd": os.getcwd()}
         state.put(d, "queue", req)
         state.event(d, "requested", id=job_id, owner=owner, kind=kind, peak_gb=peak, priority=priority)
-    _say(f"{job_id} queued: {owner}:{kind}, peak {peak:g} GB ({source}), {priority}")
+    _say(f"{job_id} queued: {owner}:{kind}, peak {peak:g} GB ({source}), cap {cap:g} GB, {priority}")
 
     t0 = time.time()
     last_why = None
@@ -168,28 +185,37 @@ def run(argv: List[str], owner: str, kind: str, declared_gb: Optional[float],
             state.drop(d, "queue", job_id)
         return 130
 
-    cap = cap_gb or min(max(peak * 1.5, peak + 2.0), 14.0)
-    return _execute(job_id, req, argv, cap, timeout_secs, t0)
+    return _execute(job_id, req, argv, cap, timeout_secs, t0, scoped)
+
+
+def _record_job(job_id: str, **fields) -> None:
+    with state.locked() as d:
+        lease = next((v for v in state.entries(d, "leases") if v["id"] == job_id), None)
+        if lease is not None:
+            lease.update(fields)
+            state.put(d, "leases", lease)
 
 
 def _execute(job_id: str, req: Dict, argv: List[str], cap: float, timeout_secs: Optional[float],
-             t_request: float) -> int:
-    scoped = probe.systemd_scopes_usable()
+             t_request: float, scoped: bool) -> int:
     unit = f"grace-sched-{job_id}"
     env = _job_env({"GRACE_SCHED_JOB": job_id})
     if scoped:
-        _shield_caller()
         cmd = ["systemd-run", "--user", "--scope", "-q", f"--unit={unit}",
                "-p", f"MemoryMax={cap:.1f}G", "-p", "MemorySwapMax=0", "--",
                "bash", "-c",
                'echo 1 > "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.oom.group" 2>/dev/null; exec "$@"',
                "grace-sched", *argv]
     else:
-        _say("systemd user scopes unavailable: running WITHOUT a memory cap, sampled by process group")
+        _say(f"systemd user scopes unavailable (GRACE_SCHED_ALLOW_UNCAPPED=1): no kernel cap; the job's "
+             f"process group is killed when its RSS passes {cap:.1f} GB")
         cmd = argv
     _say(f"{job_id} running (cap {cap:.1f} GB): {' '.join(argv)[:200]}")
     started = time.time()
     child = subprocess.Popen(cmd, env=env, close_fds=True, start_new_session=True)
+    # The process group first, at once: if this supervisor dies from here on,
+    # the lease can still tell the job is alive (state.reap).
+    _record_job(job_id, pgid=child.pid, unit=unit if scoped else None)
     cgroup = None
     if scoped:
         for _ in range(50):
@@ -198,11 +224,8 @@ def _execute(job_id: str, req: Dict, argv: List[str], cap: float, timeout_secs: 
                 cgroup = rel
                 break
             time.sleep(0.1)
-    with state.locked() as d:
-        lease = next((v for v in state.entries(d, "leases") if v["id"] == job_id), None)
-        if lease is not None:
-            lease.update({"cgroup": cgroup, "pgid": child.pid, "unit": unit if scoped else None})
-            state.put(d, "leases", lease)
+        if cgroup:
+            _record_job(job_id, cgroup=cgroup)
 
     def forward(signum, _frame):
         try:
@@ -214,15 +237,22 @@ def _execute(job_id: str, req: Dict, argv: List[str], cap: float, timeout_secs: 
         signal.signal(s, forward)
 
     peak_seen = 0.0
+    oom_seen = 0
     timed_out = False
+    polled_cap_kill = False
     while child.poll() is None:
         # `memory.peak` is the kernel's running maximum for the scope, so each
         # read already includes a spike that came and went between reads. The
         # scope vanishes when the job exits, so it is read while it lives.
         if cgroup:
             used = probe.cgroup_gb(cgroup, "memory.peak") or probe.cgroup_gb(cgroup)
+            oom_seen = max(oom_seen, probe.oom_kills(cgroup))
         else:
             used = probe.rss_gb_of_group(child.pid)
+            if used > cap and not polled_cap_kill:
+                polled_cap_kill = True
+                _say(f"{job_id} passed its {cap:.1f} GB cap ({used:.2f} GB RSS): killing its own process group")
+                forward(signal.SIGKILL, None)
         peak_seen = max(peak_seen, used or 0.0)
         if timeout_secs and time.time() - started > timeout_secs:
             timed_out = True
@@ -235,21 +265,31 @@ def _execute(job_id: str, req: Dict, argv: List[str], cap: float, timeout_secs: 
         time.sleep(0.2)
     rc = child.returncode
     kernel_peak = probe.cgroup_gb(cgroup, "memory.peak") if cgroup else None
+    if cgroup:
+        oom_seen = max(oom_seen, probe.oom_kills(cgroup))
     peak_gb = round(max(peak_seen, kernel_peak or 0.0), 2)
-    if rc in (137, -9) and not timed_out:
-        # Killed at its cap: it reached at least the cap, whatever the last
-        # poll saw, and the next estimate must learn that.
+    killed = rc in (137, -9) and not timed_out
+    # Exit 137 alone could be an operator's SIGKILL or the host's OOM killer.
+    # A cap kill needs the kernel's word for THIS scope (memory.events, or
+    # systemd's Result), or our own polled-cap kill.
+    result = probe.unit_result(f"{unit}.scope") if scoped else ""
+    oom = killed and (oom_seen > 0 or result == "oom-kill" or polled_cap_kill)
+    if scoped:
+        probe.reset_failed(f"{unit}.scope")
+    if oom:
+        # It reached at least the cap, whatever the last poll saw, and the
+        # next estimate must learn that.
         peak_gb = max(peak_gb, round(cap, 2))
     secs = round(time.time() - started)
     with state.locked() as d:
         state.drop(d, "leases", job_id)
-        oom = rc in (137, -9) and not timed_out
         state.record(d, kind=req["kind"], owner=req["owner"], peak_gb=peak_gb, secs=secs, rc=rc,
                      oom_killed=oom, timed_out=timed_out, cap_gb=round(cap, 1),
                      peak_estimate_gb=req["peak_gb"], at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
         state.event(d, "finished", id=job_id, owner=req["owner"], kind=req["kind"], rc=rc,
                     secs=secs, peak_gb=peak_gb, waited_secs=round(started - t_request),
                     oom_killed=oom, timed_out=timed_out)
-    note = " (killed at its memory cap)" if rc in (137, -9) and not timed_out else ""
+    note = " (killed at its memory cap)" if oom else (" (killed by SIGKILL from outside: not a cap kill)"
+                                                     if killed else "")
     _say(f"{job_id} done: rc {rc}{note}, {secs} s, peak {peak_gb:g} GB (estimate {req['peak_gb']:g})")
     return 124 if timed_out else (rc if rc >= 0 else 128 - rc)

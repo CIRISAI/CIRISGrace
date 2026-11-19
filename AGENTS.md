@@ -38,7 +38,7 @@
 - When a gate's failure is caused by an upstream obligation, add a row to `evidence/blocked_upstream.tsv` with a scannable predicate rather than a prose note.
 
 ## The build scheduler (`grace/sched/`)
-- The one Grace component that RUNS something: the command its caller hands it, inside a capped systemd scope. It never starts, stops or edits anything else. Its timeout kills its own scope only; it never matches processes by name.
+- The one Grace component that RUNS something: the command its caller hands it, inside a capped systemd scope. It never starts, stops or edits anything else, the caller's own unit included. It refuses to run a job it cannot hard-cap (exit 78) unless `GRACE_SCHED_ALLOW_UNCAPPED=1`, and admission reserves each job's cap, not its estimate. Its timeout kills its own scope only; it never matches processes by name.
 - Admission rules live in `policy.py` as pure functions with one unit test per rule (`tests/test_sched.py`); a new rule comes with the incident that taught it.
 - State is plain JSON under `$GRACE_SCHED_DIR`. The mutex is held for milliseconds, never across a job.
 

@@ -13,7 +13,12 @@ named where it is enforced:
   minus what it uses now). Granting on ``free -g`` alone overcommitted three
   jobs and the low-memory reaper killed one at 92 %.
 - KEEP A FLOOR. Nothing starts unless ``floor_gb`` stays available after its
-  peak: the agents themselves, browsers and databases live in that floor.
+  budget: the agents themselves, browsers and databases live in that floor.
+- BUDGET THE CAP, NOT THE ESTIMATE. A job may grow to its hard memory cap
+  before the kernel stops it, so admission reserves the cap (``budget_gb``).
+  Reserving only the estimate let several light jobs, each under its own
+  cap, together eat the floor. Heavy or light is still judged on the
+  estimate.
 - DISK IS A RESOURCE. Below ``disk_floor_gb`` free, nothing starts: a full
   disk fails every session's writes at once.
 - PRIORITY, THEN FIFO; RESERVATIONS ARE KEPT. Critical-path work goes
@@ -50,9 +55,14 @@ class Request:
     peak_gb: float
     priority: str = "normal"
     created: float = 0.0
+    #: what admission reserves: the job's hard cap (default: the estimate)
+    budget_gb: Optional[float] = None
 
     def heavy(self, p: Policy) -> bool:
         return self.peak_gb > p.heavy_gb
+
+    def budget(self) -> float:
+        return max(self.peak_gb, self.budget_gb or 0.0)
 
 
 @dataclass(frozen=True)
@@ -62,13 +72,15 @@ class Running:
     kind: str
     peak_gb: float
     used_gb: float = 0.0
+    #: the job's hard cap, which it may grow into (default: the estimate)
+    budget_gb: Optional[float] = None
 
     def heavy(self, p: Policy) -> bool:
         return self.peak_gb > p.heavy_gb
 
     def headroom_gb(self) -> float:
-        """What this job has still to grow into before its expected peak."""
-        return max(0.0, self.peak_gb - self.used_gb)
+        """What this job may still grow into before its cap stops it."""
+        return max(0.0, max(self.peak_gb, self.budget_gb or 0.0) - self.used_gb)
 
 
 @dataclass(frozen=True)
@@ -138,17 +150,17 @@ def decide(
             if now - r.created >= policy.starve_secs:
                 head_starving = r
             continue
-        need = r.peak_gb + policy.floor_gb
+        need = r.budget() + policy.floor_gb
         if room < need:
             d.waits[r.id] = (
-                f"memory: needs {r.peak_gb:.1f} GB plus the {policy.floor_gb:.0f} GB floor, "
+                f"memory: needs {r.budget():.1f} GB (its cap) plus the {policy.floor_gb:.0f} GB floor, "
                 f"{room:.1f} GB projected free once running jobs reach their peaks"
             )
             if heavy and now - r.created >= policy.starve_secs:
                 head_starving = r
             continue
         d.start.append(r.id)
-        room -= r.peak_gb
+        room -= r.budget()
         count += 1
         if heavy:
             started_heavy = r

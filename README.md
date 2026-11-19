@@ -77,8 +77,13 @@ The rules, each from a real incident (see `grace/sched/policy.py`):
 | "Done" is the job exiting; every event goes to `events.jsonl` | Peers had to remember to report |
 | `status` names why each waiter waits; `doctor` flags a wait with no reason | A session waited 10 min on a free box |
 | Builds under the legacy guard count as running at their own cap | It stays safe while sessions migrate |
+| Admission reserves each job's hard cap, not its estimate | Light jobs each under their own cap could together eat the floor |
+| No hard cap, no run (exit 78), unless `GRACE_SCHED_ALLOW_UNCAPPED=1` | An uncapped job can outgrow what admission reserved |
+| A cap kill needs the kernel's word (`memory.events` or `Result=oom-kill`) | An outside SIGKILL recorded as a cap kill inflated the next estimate |
+| A lease outlives a dead supervisor while its job still runs | Reclaiming it hid a live build from admission |
+| The scheduler changes nothing outside its job's scope | It once marked the caller's whole unit OOM-avoid |
 
-State lives in `/tmp/grace-sched-<uid>` (`$GRACE_SCHED_DIR`): plain JSON you can
+State lives in `/run/user/<uid>/grace-sched` (else `/tmp/grace-sched-<uid>`; `$GRACE_SCHED_DIR` overrides), refused unless it is a real directory owned by you and closed to others: plain JSON you can
 `cat`. Knobs: `GRACE_SCHED_FLOOR_GB`, `GRACE_SCHED_HEAVY_GB`,
 `GRACE_SCHED_DISK_FLOOR_GB`, `GRACE_SCHED_MAX_RUNNING`, `GRACE_SCHED_STARVE_SECS`.
 Defaults for a build: `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=2`.

@@ -8,7 +8,8 @@
     grace sched history [--kind K]    measured peaks and durations
 
 Exit codes for `run`: the job's own, 75 when it waited too long, 77 for
-usage, 124 for its own timeout. A job killed at its memory cap exits 137.
+usage, 78 when no hard memory cap can be applied or the state directory is
+not private, 124 for its own timeout. A job killed at its memory cap exits 137.
 """
 
 from __future__ import annotations
@@ -149,6 +150,14 @@ def cmd_history(a) -> int:
 
 
 def main(argv: List[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except state.UnsafeStateDir as e:
+        print(f"grace-sched: {e}", file=sys.stderr)
+        return runner.EXIT_NO_CAP
+
+
+def _main(argv: List[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="grace sched", description="the shared box's build scheduler")
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="wait for admission, then run a job capped in its own scope")
