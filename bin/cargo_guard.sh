@@ -16,10 +16,21 @@ here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # wrappers (nice -n 19, ionice -c3, env A=b, timeout 600, ...) are skipped.
 # Every session called `cargo_guard.sh nice -n 19 ionice -c3 cargo ...`, which
 # keyed all their history as "nice -n 19" (edge, 2026-11-19).
+# A wrapper option that takes its value as the next word (`timeout -s TERM
+# 300`, `env -u VAR`) consumes that word too, or the value would be taken
+# for the command (Codex on #4).
 real=("$@")
+wrapper=""
 while [ ${#real[@]} -gt 1 ]; do
-  case "${real[0]}" in
-    nice|ionice|env|timeout|stdbuf|chrt|taskset|setsid|-*|[0-9]*|*=*) real=("${real[@]:1}") ;;
+  case "$wrapper:${real[0]}" in
+    nice:-n|nice:--adjustment|ionice:-[cnpPu]|ionice:--class|ionice:--classdata|timeout:-[sk]|\
+    timeout:--signal|timeout:--kill-after|stdbuf:-[ioe]|env:-[uCS]|env:--unset|env:--chdir|\
+    env:--split-string|taskset:-c|taskset:--cpu-list)
+      [ ${#real[@]} -gt 2 ] || break
+      real=("${real[@]:2}") ;;
+    *:nice|*:ionice|*:env|*:timeout|*:stdbuf|*:chrt|*:taskset|*:setsid)
+      wrapper="${real[0]}"; real=("${real[@]:1}") ;;
+    *:-*|*:[0-9]*|*:*=*) real=("${real[@]:1}") ;;
     *) break ;;
   esac
 done

@@ -347,6 +347,19 @@ class Run(unittest.TestCase):
         kind = self._last_history()["kind"]
         self.assertTrue(kind.endswith(": true check --lib"), kind)
 
+    def test_the_shim_skips_a_wrapper_options_separate_value(self):
+        # Codex on #4: `timeout -s TERM 300 cargo ...` took TERM for the command,
+        # so the kind carried the duration and learned nothing across runs.
+        for wrapped in (["timeout", "-s", "TERM", "300"], ["timeout", "--kill-after", "5", "60"],
+                        ["env", "-u", "FOO", "nice", "-n", "5"], ["stdbuf", "-o", "L"],
+                        ["taskset", "-c", "0-3"]):
+            r = subprocess.run([str(ROOT / "bin" / "cargo_guard.sh"), *wrapped, "true", "check", "--lib"],
+                               env={**self.env, "GRACE_SCHED_PEAK_GB": "0.1"}, capture_output=True, text=True,
+                               cwd=self.tmp.name)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            kind = self._last_history()["kind"]
+            self.assertTrue(kind.endswith(": true check --lib"), (wrapped, kind))
+
     def test_status_shows_a_waiter_and_why(self):
         # A held heavy lease (this test process), then a heavy request waits.
         with_env = dict(os.environ)
