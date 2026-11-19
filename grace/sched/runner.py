@@ -39,6 +39,7 @@ release.
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -112,6 +113,12 @@ def tick(d) -> pol.Decision:
             v["waiting_for"] = why
             state.put(d, "queue", v)
     return dec
+
+
+def reason_gist(why: str) -> str:
+    """A wait reason with its live figures blanked, so a waiter says why once per
+    reason rather than once per poll."""
+    return re.sub(r"\d+(\.\d+)?", "#", why)
 
 
 def _job_env(extra: Dict[str, str]) -> Dict[str, str]:
@@ -204,9 +211,13 @@ def run(argv: List[str], owner: str, kind: str, declared_gb: Optional[float],
                                 waited_secs=round(time.time() - t0), projected_gb=dec.projected_gb)
                     break
                 why = dec.waits.get(job_id, "waiting")
-            if why != last_why:
+            # Say why once per reason, not once per tick: the reason carries live
+            # figures (projected GB, minutes waited) that change every poll, and
+            # printing each one buried a waiting build's log (2026-11-19).
+            gist = reason_gist(why)
+            if gist != last_why:
                 _say(f"{job_id} waits: {why}")
-                last_why = why
+                last_why = gist
             if time.time() - t0 > wait_secs:
                 with state.locked() as d:
                     state.drop(d, "queue", job_id)

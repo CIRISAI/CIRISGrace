@@ -93,6 +93,15 @@ class Policy(unittest.TestCase):
         running = [pol.Running("r", "o", "k", peak_gb=2, used_gb=2, budget_gb=5)]
         self.assertEqual(pol.projected(pol.Machine(20, BIG_DISK), running), 17)
 
+    def test_a_waiter_says_why_once_per_reason_not_per_poll(self):
+        # 2026-11-19: the projected-GB figure changed every 3 s poll, and each
+        # change printed another "waits:" line (over 100 for one cargo fmt).
+        from grace.sched.runner import reason_gist
+        a = "memory: needs 9.0 GB plus the 8 GB floor, 14.2 GB projected free once running jobs reach their peaks"
+        b = "memory: needs 9.0 GB plus the 8 GB floor, 13.7 GB projected free once running jobs reach their peaks"
+        self.assertEqual(reason_gist(a), reason_gist(b))
+        self.assertNotEqual(reason_gist(a), reason_gist("one heavy job at a time: edge:check holds it"))
+
     def test_a_measured_spike_raises_a_low_declaration(self):
         # 2026-11-19: a "4 GB" job spiked to 4.9 GB, which a 1 s poll missed.
         peak, src = pol.estimate_peak(4.0, [4.9])
