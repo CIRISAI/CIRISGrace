@@ -276,7 +276,18 @@ class Run(unittest.TestCase):
         from grace.sched import runner
         self.assertEqual(runner.default_cap(6.0, "default (no declaration, no history)"), 11.0)
         self.assertEqual(runner.default_cap(2.0, "declared"), 4.0)
-        self.assertEqual(runner.default_cap(12.0, "learned (3 runs)"), 14.0)
+        self.assertEqual(runner.default_cap(12.0, "learned (3 runs)", runs=3), 14.0)
+
+    def test_one_quiet_run_does_not_shrink_an_undeclared_cap(self):
+        # 2026-11-19: edge's first `git push` ran no hook build (0.02 GB); the
+        # learned cap (2 GB) then killed the next push, whose hook ran clippy.
+        from grace.sched import runner
+        peak, source = pol.estimate_peak(None, [0.02])
+        self.assertEqual(runner.default_cap(peak, source, runs=1), 11.0)
+        self.assertEqual(runner.default_cap(peak, source, runs=2), 11.0)
+        peak3, source3 = pol.estimate_peak(None, [0.02, 5.9, 5.8])
+        self.assertEqual(runner.default_cap(peak3, source3, runs=3), 10.2)
+        self.assertEqual(runner.default_cap(2.0, "declared", runs=0), 4.0, "a declaration is believed at once")
 
     def test_a_heavy_job_holds_the_legacy_guards_free_slots(self):
         import fcntl
