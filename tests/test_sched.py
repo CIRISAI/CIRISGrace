@@ -225,6 +225,8 @@ class Run(unittest.TestCase):
         self.env = {**os.environ, "GRACE_SCHED_DIR": self.tmp.name, "GRACE_SCHED_NO_SYSTEMD": "1", "GRACE_SCHED_COUNT_LEGACY": "0",
                     "GRACE_SCHED_ALLOW_UNCAPPED": "1",
                     "GRACE_SCHED_FLOOR_GB": "0", "GRACE_SCHED_DISK_FLOOR_GB": "0",
+                    # a heavy test job must never take the box's real legacy slot locks
+                    "GRACE_SCHED_LEGACY_LOCK": str(Path(self.tmp.name, "no-legacy.lock")),
                     "PYTHONPATH": str(ROOT)}
 
     def tearDown(self):
@@ -325,6 +327,30 @@ class Run(unittest.TestCase):
         peak3, source3 = pol.estimate_peak(None, [0.02, 5.9, 5.8])
         self.assertEqual(runner.default_cap(peak3, source3, runs=3), 10.2)
         self.assertEqual(runner.default_cap(2.0, "declared", runs=0), 4.0, "a declaration is believed at once")
+
+    def _seed(self, kind, *peaks):
+        for pk in peaks:
+            state.record(Path(self.tmp.name), kind=kind, peak_gb=pk)
+
+    def test_a_declared_job_above_its_declaration_keeps_the_calculated_cap(self):
+        # Codex on #6: a declared 8 GB job with a 9 GB run behind it got the
+        # 11 GB warm-up cap meant for undeclared jobs, not its 14 GB. Here at a
+        # smaller scale: declared 0.8, one 0.9 run, so its cap is 1.0 + 2.
+        self._seed("decl", 0.9)
+        r = self.sched("run", "--kind", "decl", "--peak", "0.8", "--wait", "60", "--", "true")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._last_history()["cap_gb"], 3.0, r.stderr)
+
+    def test_a_warming_kind_stays_in_the_heavy_slot(self):
+        # Codex on #6: one quiet run (0.02 GB) rounded the estimate to 0 GB, so
+        # the kind's next run, which may build, was admitted as light work.
+        self._seed("quiet", 0.02)
+        r = self.sched("run", "--kind", "quiet", "--cap", "0.5", "--wait", "60", "--", "true")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertGreater(self._last_history()["peak_estimate_gb"], pol.Policy().heavy_gb, r.stderr)
+        self._seed("quiet", 0.02, 0.02)
+        r = self.sched("run", "--kind", "quiet", "--cap", "0.5", "--wait", "60", "--", "true")
+        self.assertLess(self._last_history()["peak_estimate_gb"], 1.0, "after LEARN_RUNS runs it is learned")
 
     def test_a_heavy_job_holds_the_legacy_guards_free_slots(self):
         import fcntl

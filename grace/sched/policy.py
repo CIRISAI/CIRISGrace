@@ -181,10 +181,14 @@ def decide(
     return d
 
 
+#: The peak a job with no declaration and no history is admitted at.
+UNKNOWN_PEAK_GB = 6.0
+
+
 def estimate_peak(
     declared_gb: Optional[float],
     history_gb: List[float],
-    default_gb: float = 6.0,
+    default_gb: float = UNKNOWN_PEAK_GB,
     margin: float = 1.15,
 ) -> Tuple[float, str]:
     """The peak to admit on, and where it came from.
