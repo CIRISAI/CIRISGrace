@@ -138,8 +138,18 @@ def _job_env(extra: Dict[str, str]) -> Dict[str, str]:
 UNKNOWN_JOB_CAP_GB = 11.0
 
 
-def default_cap(peak: float, source: str = "declared") -> float:
-    if source.startswith("default"):
+#: Runs of a kind before its learned peak may set an undeclared job's cap.
+LEARN_RUNS = 3
+
+
+def default_cap(peak: float, source: str = "declared", runs: int = 0) -> float:
+    """The job's memory cap when the caller sets none.
+
+    A job with no declaration keeps the legacy cap until its kind has
+    LEARN_RUNS runs behind it. One quiet run is not a measurement: edge's
+    first `git push` ran no hook build (0.02 GB), the next one ran clippy, and
+    a cap learned from the first (2 GB) killed it (2026-11-19)."""
+    if source.startswith("default") or (not source.startswith("declared") and runs < LEARN_RUNS):
         return UNKNOWN_JOB_CAP_GB
     return round(min(max(peak * 1.5, peak + 2.0), 14.0), 1)
 
@@ -187,7 +197,8 @@ def run(argv: List[str], owner: str, kind: str, declared_gb: Optional[float],
     job_id = state.new_id()
     with state.locked() as d:
         peak, source = pol.estimate_peak(declared_gb, state.history(d, kind))
-        cap = round(cap_gb, 1) if cap_gb else default_cap(peak, source)
+        runs = len(state.history(d, kind))
+        cap = round(cap_gb, 1) if cap_gb else default_cap(peak, source, runs)
         me = os.getpid()
         req = {"id": job_id, "owner": owner, "kind": kind, "peak_gb": peak, "peak_source": source,
                "cap_gb": cap, "scoped": scoped,
