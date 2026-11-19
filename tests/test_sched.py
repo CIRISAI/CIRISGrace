@@ -286,6 +286,17 @@ class Run(unittest.TestCase):
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released once the job is done
         os.close(fd)
 
+    def test_the_shim_names_the_real_command_not_its_nice_prefix(self):
+        # Edge 2026-11-19: `cargo_guard.sh nice -n 19 ionice -c3 cargo ...` keyed
+        # every session's history as "nice -n 19", so nothing was learned.
+        r = subprocess.run([str(ROOT / "bin" / "cargo_guard.sh"), "nice", "-n", "19", "ionice", "-c3",
+                            "env", "A=b", "true", "check", "--lib"],
+                           env={**self.env, "GRACE_SCHED_PEAK_GB": "0.1"}, capture_output=True, text=True,
+                           cwd=self.tmp.name)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        kind = self._last_history()["kind"]
+        self.assertTrue(kind.endswith(": true check --lib"), kind)
+
     def test_status_shows_a_waiter_and_why(self):
         # A held heavy lease (this test process), then a heavy request waits.
         with_env = dict(os.environ)
