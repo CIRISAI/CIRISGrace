@@ -173,6 +173,16 @@ class State(unittest.TestCase):
         state.root()
         self.assertEqual(target.stat().st_mode & 0o077, 0, "an open directory of ours is closed")
 
+    def test_a_torn_history_record_hides_no_later_run(self):
+        # Codex on #3: an interrupted append left a truncated line, and every
+        # measurement after it was ignored by admission.
+        d = Path(self.tmp.name)
+        state.record(d, kind="k", peak_gb=2.0)
+        with open(d / "history.jsonl", "a") as f:
+            f.write('{"kind": "k", "peak_g\n')
+        state.record(d, kind="k", peak_gb=9.0)
+        self.assertEqual(state.history(d, "k"), [2.0, 9.0])
+
     def test_a_recycled_pid_is_not_the_holder(self):
         with state.locked() as d:
             state.put(d, "leases", {"id": "y", "owner": "o", "kind": "k", "peak_gb": 1,
