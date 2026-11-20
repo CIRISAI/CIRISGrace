@@ -164,6 +164,17 @@ class Policy(unittest.TestCase):
         self.assertIn("2 heavy jobs at a time", full.waits["x"])
         self.assertEqual(pol.Policy().max_heavy, 2, "two by default")
 
+    def test_a_lone_job_on_an_idle_box_starts_when_its_cap_fits(self):
+        # 2026-11-20: persist's nextest (14.4 GB) waited forever on an empty box
+        # with 22.0 GB free because 14.4 + the 8 GB floor = 22.4.
+        lone = pol.Request("n", "persist", "nextest", 14.4, budget_gb=14.4)
+        self.assertEqual(pol.decide([lone], [], pol.Machine(22.0, BIG_DISK), P2).start, ["n"])
+        self.assertEqual(pol.decide([lone], [], pol.Machine(18.0, BIG_DISK), P2).start, [],
+                         "its cap plus half the floor (4 GB for the sessions) must still fit")
+        other = [pol.Running("r", "edge", "check", 2.0, 1.0, budget_gb=3.0)]
+        self.assertEqual(pol.decide([lone], other, pol.Machine(22.0, BIG_DISK), P2).start, [],
+                         "beside a running job the floor still applies")
+
     def test_a_measured_spike_raises_a_low_declaration(self):
         # 2026-11-19: a "4 GB" job spiked to 4.9 GB, which a 1 s poll missed.
         peak, src = pol.estimate_peak(4.0, [4.9])

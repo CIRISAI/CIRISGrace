@@ -179,6 +179,14 @@ def decide(
         # floor on top of the cap asked a 14 GB job for 22 GB free on a 31 GB
         # box, and an empty box admitted nothing (2026-11-19).
         need = max(r.budget(), r.peak_gb + policy.floor_gb)
+        # An IDLE box: no job runs and none has started this pass. The lone
+        # job is hard-capped, so the floor need only cover the sessions beside
+        # it, not a second job's growth: its cap plus HALF the floor, never
+        # more than the ordinary rule. On an empty box, the full floor on top
+        # of a margin-inflated peak held persist's lib nextest forever (14.4 +
+        # 8 = 22.4 GB against 22.0 free, nothing running, 2026-11-20).
+        if not running and not d.start:
+            need = min(need, r.budget() + policy.floor_gb / 2)
         if room < need:
             d.waits[r.id] = (
                 f"memory: needs {r.budget():.1f} GB for its cap and {r.peak_gb:.1f} GB plus the "
