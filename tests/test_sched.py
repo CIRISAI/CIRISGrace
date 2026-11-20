@@ -175,6 +175,19 @@ class Policy(unittest.TestCase):
         self.assertEqual(pol.decide([lone], other, pol.Machine(22.0, BIG_DISK), P2).start, [],
                          "beside a running job the floor still applies")
 
+    def test_a_waiting_critical_job_holds_back_other_heavy_starts(self):
+        # Eric 2026-11-20: persist's critical lane waited ten minutes while an
+        # edge test lane held the memory. Once a critical heavy job waits,
+        # nothing heavy of a lower class starts ahead of it; light work may.
+        running = [pol.Running("e", "edge", "lib tests", 9.1, 1.3, budget_gb=13.6)]
+        crit = pol.Request("p", "persist", "nextest", 12.5, "critical", 0, budget_gb=14.0)
+        normal = pol.Request("n", "edge", "check", 5.0, "normal", 1, budget_gb=7.0)
+        light = pol.Request("l", "verify", "fmt", 0.5, "normal", 2, budget_gb=2.5)
+        d = pol.decide([crit, normal, light], running, pol.Machine(26, BIG_DISK), P2)
+        self.assertNotIn("p", d.start, "memory is short: it waits")
+        self.assertIn("behind the critical persist:nextest", d.waits["n"])
+        self.assertIn("l", d.start, "light work still backfills")
+
     def test_a_measured_spike_raises_a_low_declaration(self):
         # 2026-11-19: a "4 GB" job spiked to 4.9 GB, which a 1 s poll missed.
         peak, src = pol.estimate_peak(4.0, [4.9])

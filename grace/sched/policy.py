@@ -133,6 +133,12 @@ def decide(
     heavy_holders: List[str] = [f"{r.owner}:{r.kind}" for r in running if r.heavy(policy)]
     count = len(running)
     head_starving: Optional[Request] = None
+    #: A critical heavy job that could not start this pass. Nothing heavy of a
+    #: lower class starts until it does, so memory a normal job would take is
+    #: there for it the moment running jobs free it (Eric, 2026-11-20: persist
+    #: v62 is the critical path; an edge test lane started beside a waiting
+    #: critical lane would hold its memory for ten minutes).
+    critical_waiting: Optional[Request] = None
 
     if machine.disk_free_gb < policy.disk_floor_gb:
         for r in queue:
@@ -162,6 +168,12 @@ def decide(
             d.waits[r.id] = f"{count} jobs running, the most this box runs at once"
             continue
         heavy = r.heavy(policy)
+        if heavy and critical_waiting is not None and r.priority != "critical":
+            d.waits[r.id] = (
+                f"behind the critical {critical_waiting.owner}:{critical_waiting.kind}: no other "
+                "heavy job starts until it does"
+            )
+            continue
         if heavy and reserved_for and r.owner != reserved_for:
             d.waits[r.id] = f"the heavy slot is promised to {reserved_for}"
             continue
@@ -173,6 +185,8 @@ def decide(
                                  f"{', '.join(heavy_holders)} hold the slots")
             if now - r.created >= policy.starve_secs:
                 head_starving = r
+            if r.priority == "critical":
+                critical_waiting = critical_waiting or r
             continue
         # The cap must fit in what is projected free (the worst case: the job
         # grows to its cap), and the EXPECTED peak must leave the floor. The
@@ -195,6 +209,8 @@ def decide(
             )
             if heavy and now - r.created >= policy.starve_secs:
                 head_starving = r
+            if heavy and r.priority == "critical":
+                critical_waiting = critical_waiting or r
             continue
         d.start.append(r.id)
         room -= r.budget()
