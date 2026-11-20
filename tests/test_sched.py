@@ -17,7 +17,8 @@ sys.path.insert(0, str(ROOT))
 from grace.sched import policy as pol  # noqa: E402
 from grace.sched import probe, state  # noqa: E402
 
-P = pol.Policy(floor_gb=8, heavy_gb=4, disk_floor_gb=30, max_running=4, starve_secs=1800)
+P = pol.Policy(floor_gb=8, heavy_gb=4, disk_floor_gb=30, max_running=4, starve_secs=1800, max_heavy=1)
+P2 = pol.Policy(floor_gb=8, heavy_gb=4, disk_floor_gb=30, max_running=4, starve_secs=1800, max_heavy=2)
 BIG_DISK = 200.0
 
 
@@ -133,13 +134,35 @@ class Policy(unittest.TestCase):
     def test_a_job_too_big_for_any_cap_is_refused_on_measured_need_only(self):
         # Codex on #3: a job whose estimate is above any cap would be killed at it.
         from grace.sched import runner
-        self.assertIn("measured need", runner.too_big_for_box(None, 16.1, [14.0], None))
+        self.assertIn("measured need", runner.too_big_for_box(None, 18.5, [16.1], None))
+        # 2026-11-20: persist's lib nextest needs 12.3 GB; its estimate (14.1 with
+        # the 15% margin) is above the 14 GB cap, but the measured need is not.
+        self.assertIsNone(runner.too_big_for_box(9.0, 14.1, [12.3], None))
         self.assertIn("declared peak", runner.too_big_for_box(20.0, 20.0, [], None))
         self.assertIsNone(runner.too_big_for_box(None, 16.1, [14.0], 16.0), "an explicit --cap is the caller's")
         # Old records carry only memory.peak (page cache included): they never refuse
         # a build that reached the cap through cache and finished cleanly.
         self.assertIsNone(runner.too_big_for_box(None, 16.1, [], None))
         self.assertIsNone(runner.too_big_for_box(None, 9.0, [8.0], None))
+
+    def test_two_heavy_jobs_run_at_once_when_both_caps_fit(self):
+        # Eric 2026-11-20: persist's v62 push needs more than one heavy build.
+        # Each job is hard-capped in its own scope and admission reserves the
+        # caps, so the second starts only when its cap fits beside the first.
+        test = pol.Request("t", "persist", "nextest", 12.3, budget_gb=14.0)
+        clippy = pol.Request("c", "persist", "clippy", 6.0, budget_gb=9.0, created=1)
+        d = pol.decide([test, clippy], [], pol.Machine(30, BIG_DISK), P2)
+        self.assertEqual(d.start, ["t", "c"], "after the test's 14 GB cap, 16 GB remain: clippy's 6 + 8 floor fits")
+        tight = pol.decide([test, clippy], [], pol.Machine(22, BIG_DISK), P2)
+        self.assertEqual(tight.start, ["t"], "the second cap does not fit: memory, not a count, says no")
+        self.assertIn("memory:", tight.waits["c"])
+        third = pol.Request("x", "edge", "check", 5.0, budget_gb=7.0, created=2)
+        running = [pol.Running("t", "persist", "nextest", 12.3, 3, budget_gb=14.0),
+                   pol.Running("c", "persist", "clippy", 6.0, 2, budget_gb=9.0)]
+        full = pol.decide([third], running, pol.Machine(60, BIG_DISK), P2)
+        self.assertEqual(full.start, [])
+        self.assertIn("2 heavy jobs at a time", full.waits["x"])
+        self.assertEqual(pol.Policy().max_heavy, 2, "two by default")
 
     def test_a_measured_spike_raises_a_low_declaration(self):
         # 2026-11-19: a "4 GB" job spiked to 4.9 GB, which a 1 s poll missed.
@@ -254,6 +277,7 @@ class Run(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.env = {**os.environ, "GRACE_SCHED_DIR": self.tmp.name, "GRACE_SCHED_NO_SYSTEMD": "1", "GRACE_SCHED_COUNT_LEGACY": "0",
+                    "GRACE_SCHED_MAX_HEAVY": "1",
                     "GRACE_SCHED_ALLOW_UNCAPPED": "1",
                     "GRACE_SCHED_FLOOR_GB": "0", "GRACE_SCHED_DISK_FLOOR_GB": "0",
                     # a heavy test job must never take the box's real legacy slot locks

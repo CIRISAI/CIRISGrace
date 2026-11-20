@@ -4,9 +4,11 @@ Pure functions over plain data, so every rule is a unit test and none needs
 a machine. The rules are the shared box's lessons (2026-10 .. 2026-11), each
 named where it is enforced:
 
-- ONE HEAVY JOB AT A TIME. A heavy job is one whose expected peak is above
-  ``heavy_gb``. Two at once is how the kernel's OOM killer and systemd-oomd
-  took whole terminal scopes, every agent in them.
+- AT MOST ``max_heavy`` HEAVY JOBS AT ONCE (default 2). A heavy job is one
+  whose expected peak is above ``heavy_gb``. Two UNCAPPED at once is how the
+  kernel's OOM killer and systemd-oomd took whole terminal scopes, every agent
+  in them; every job now runs hard-capped in its own scope and admission
+  reserves each cap, so a second heavy job starts only when both caps fit.
 - ADMIT ON PROJECTED MEMORY, NOT CURRENT. A build that has just started has
   not reached its peak. Projected available is ``available now - the
   headroom every running job has still to grow into`` (its expected peak
@@ -49,6 +51,11 @@ class Policy:
     disk_floor_gb: float = 30.0
     max_running: int = 4
     starve_secs: float = 1800.0
+    #: Heavy jobs at once. Each runs hard-capped in its own scope and admission
+    #: reserves every cap, so the memory budget, not a count of one, is what
+    #: keeps them apart (Eric, 2026-11-20: persist's v62 push needs more than
+    #: one heavy build at a time). 1 restores the old one-at-a-time rule.
+    max_heavy: int = 2
 
 
 @dataclass(frozen=True)
@@ -123,8 +130,7 @@ def decide(
     d = Decision()
     room = projected(machine, running)
     d.projected_gb = round(room, 1)
-    heavy_holder: Optional[Running] = next((r for r in running if r.heavy(policy)), None)
-    started_heavy: Optional[Request] = None
+    heavy_holders: List[str] = [f"{r.owner}:{r.kind}" for r in running if r.heavy(policy)]
     count = len(running)
     head_starving: Optional[Request] = None
 
@@ -159,9 +165,12 @@ def decide(
         if heavy and reserved_for and r.owner != reserved_for:
             d.waits[r.id] = f"the heavy slot is promised to {reserved_for}"
             continue
-        if heavy and (heavy_holder is not None or started_heavy is not None):
-            who = heavy_holder or started_heavy
-            d.waits[r.id] = f"one heavy job at a time: {who.owner}:{who.kind} holds it"
+        if heavy and len(heavy_holders) >= policy.max_heavy:
+            if policy.max_heavy == 1:
+                d.waits[r.id] = f"one heavy job at a time: {heavy_holders[0]} holds it"
+            else:
+                d.waits[r.id] = (f"{policy.max_heavy} heavy jobs at a time: "
+                                 f"{', '.join(heavy_holders)} hold the slots")
             if now - r.created >= policy.starve_secs:
                 head_starving = r
             continue
@@ -183,7 +192,7 @@ def decide(
         room -= r.budget()
         count += 1
         if heavy:
-            started_heavy = r
+            heavy_holders.append(f"{r.owner}:{r.kind}")
     return d
 
 

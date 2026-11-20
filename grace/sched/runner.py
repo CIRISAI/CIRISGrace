@@ -110,6 +110,7 @@ def policy_from_env() -> pol.Policy:
         heavy_gb=float(e("GRACE_SCHED_HEAVY_GB", 4)),
         disk_floor_gb=float(e("GRACE_SCHED_DISK_FLOOR_GB", 30)),
         max_running=int(e("GRACE_SCHED_MAX_RUNNING", 4)),
+        max_heavy=int(e("GRACE_SCHED_MAX_HEAVY", 2)),
         starve_secs=float(e("GRACE_SCHED_STARVE_SECS", 1800)),
     )
 
@@ -229,8 +230,12 @@ def too_big_for_box(declared_gb: Optional[float], need_gb: float, need_history: 
         return None
     if declared_gb is not None and declared_gb > MAX_CAP_GB:
         return f"declared peak {declared_gb:g} GB is above the {MAX_CAP_GB:g} GB this box caps a job at"
-    if need_history and need_gb > MAX_CAP_GB:
-        return (f"this kind's measured need ({need_gb:g} GB, from {len(need_history)} runs) is above the "
+    # The MEASURED need, not the estimate: the estimate carries a 15% margin,
+    # and a lane that really needs 12.3 GB (persist's lib nextest, 2026-11-20)
+    # would be refused at its 14.1 GB estimate though its 14 GB cap holds it.
+    measured = max(need_history[-5:]) if need_history else 0.0
+    if need_history and measured > MAX_CAP_GB:
+        return (f"this kind's measured need ({measured:g} GB, from {len(need_history)} runs) is above the "
                 f"{MAX_CAP_GB:g} GB this box caps a job at")
     return None
 
