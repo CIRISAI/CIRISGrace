@@ -171,9 +171,20 @@ class Policy(unittest.TestCase):
         self.assertEqual(pol.decide([lone], [], pol.Machine(22.0, BIG_DISK), P2).start, ["n"])
         self.assertEqual(pol.decide([lone], [], pol.Machine(18.0, BIG_DISK), P2).start, [],
                          "its cap plus half the floor (4 GB for the sessions) must still fit")
-        other = [pol.Running("r", "edge", "check", 2.0, 1.0, budget_gb=3.0)]
-        self.assertEqual(pol.decide([lone], other, pol.Machine(22.0, BIG_DISK), P2).start, [],
-                         "beside a running job the floor still applies")
+        heavy = [pol.Running("r", "edge", "check", 6.0, 1.0, budget_gb=9.0)]
+        self.assertEqual(pol.decide([lone], heavy, pol.Machine(30.0, BIG_DISK), P2).start, [],
+                         "beside a running HEAVY job the full floor still applies")
+
+    def test_a_light_job_beside_does_not_end_idle(self):
+        # 2026-11-21: a 2 GB client localize task (using 0.02 GB) held persist's
+        # critical clippy: 13.2 + the 8 GB floor = 21.2 GB against 21.0 free.
+        # The light job's memory is already reserved; only a heavy job ends idle.
+        crit = pol.Request("p", "persist", "clippy", 13.2, "critical", budget_gb=14.0)
+        light = [pol.Running("l", "CIRISClient", "localize", 0.02, 1.0, budget_gb=2.0)]
+        d = pol.decide([crit], light, pol.Machine(21.0, BIG_DISK), P2)
+        self.assertEqual(d.start, ["p"], d.waits)
+        self.assertEqual(pol.decide([crit], light, pol.Machine(17.0, BIG_DISK), P2).start, [],
+                         "its cap plus half the floor must still fit beside the light job")
 
     def test_a_waiting_critical_job_holds_back_other_heavy_starts(self):
         # Eric 2026-11-20: persist's critical lane waited ten minutes while an

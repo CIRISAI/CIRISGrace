@@ -199,7 +199,12 @@ def decide(
         # more than the ordinary rule. On an empty box, the full floor on top
         # of a margin-inflated peak held persist's lib nextest forever (14.4 +
         # 8 = 22.4 GB against 22.0 free, nothing running, 2026-11-20).
-        if not running and not d.start:
+        # A LIGHT job beside it (at or under heavy_gb) does not end "idle": its
+        # memory is already reserved in `room`, and it cannot grow past its
+        # cap. Only another heavy job does. A 2 GB localize task held persist's
+        # critical clippy (13.2 + 8 = 21.2 GB against 21.0 free) while it used
+        # 0.02 GB (2026-11-21).
+        if not any(j.heavy(policy) for j in running) and not heavy_holders:
             need = min(need, r.budget() + policy.floor_gb / 2)
         if room < need:
             d.waits[r.id] = (
