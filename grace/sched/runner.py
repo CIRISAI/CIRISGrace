@@ -176,7 +176,12 @@ def default_cap(peak: float, source: str = "declared", runs: int = 0,
     "learned" source, and it keeps the calculated cap (Codex on #6)."""
     if declared is None:
         declared = source.startswith("declared")
-    calculated = round(min(max(peak * 1.5, peak + 2.0), MAX_CAP_GB), 1)
+    # The peak already carries the estimate's 15% margin over the MEASURED need,
+    # so the cap adds only a little more: x1.15 or +1.5 GB, whichever is larger
+    # (about 1.3x the measured need). x1.5 on top of the margin gave every job
+    # above ~9 GB the full 14 GB cap, and on an idle box with ~15.5 GB free a
+    # 10 GB build then needed 14 + 4 = 18 GB and never started (persist, 2026-11-21).
+    calculated = round(min(max(peak * 1.15, peak + 1.5), MAX_CAP_GB), 1)
     if source.startswith("default") or (not declared and runs < LEARN_RUNS):
         # The warm-up cap is a floor, never a ceiling: a kind still warming up
         # whose runs already reached past it keeps the calculated cap (persist's

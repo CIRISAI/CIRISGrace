@@ -212,7 +212,12 @@ def decide(
         # critical clippy (13.2 + 8 = 21.2 GB against 21.0 free) while it used
         # 0.02 GB (2026-11-21).
         if not any(j.heavy(policy) for j in running) and not heavy_holders:
-            need = min(need, r.budget() + policy.floor_gb / 2)
+            # The cap plus a quarter of the floor (the worst case, the job at its
+            # cap), and the EXPECTED peak plus half the floor (the sessions beside
+            # it). Caps sit close to the measured peak (runner.default_cap), so
+            # the two agree within a couple of GB; cap + floor/2 alone held a
+            # measured 10 GB build off a 15.5 GB idle box (2026-11-21).
+            need = min(need, max(r.budget() + policy.floor_gb / 4, r.peak_gb + policy.floor_gb / 2))
         if room < need:
             d.waits[r.id] = (
                 f"memory: needs {r.budget():.1f} GB for its cap and {r.peak_gb:.1f} GB plus the "

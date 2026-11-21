@@ -414,11 +414,20 @@ class Run(unittest.TestCase):
         unit = "grace-sched-" + json.loads(Path(self.tmp.name, "events.jsonl").read_text().splitlines()[0])["id"]
         self.assertEqual(probe.unit_result(unit + ".scope"), "success", "its own failed unit is reset")
 
+    def test_a_measured_10_gb_build_starts_on_a_15_5_gb_idle_box(self):
+        # 2026-11-21: persist's sqlite lib-test build (need ~9.9 GB, estimate 10.5)
+        # was capped at 14 GB, so an idle box needed 14 + 4 = 18 GB and it never ran.
+        from grace.sched import runner
+        cap = runner.default_cap(10.5, "declared")
+        self.assertEqual(cap, 12.1)
+        req = pol.Request("p", "persist", "nextest", 10.5, "critical", budget_gb=cap)
+        self.assertEqual(pol.decide([req], [], pol.Machine(15.5, BIG_DISK), P2).start, ["p"])
+
     def test_an_unknown_job_keeps_the_legacy_guards_cap(self):
         from grace.sched import runner
         self.assertEqual(runner.default_cap(6.0, "default (no declaration, no history)"), 11.0)
-        self.assertEqual(runner.default_cap(2.0, "declared"), 4.0)
-        self.assertEqual(runner.default_cap(12.0, "learned (3 runs)", runs=3), 14.0)
+        self.assertEqual(runner.default_cap(2.0, "declared"), 3.5)
+        self.assertEqual(runner.default_cap(12.0, "learned (3 runs)", runs=3), 13.8)
 
     def test_one_quiet_run_does_not_shrink_an_undeclared_cap(self):
         # 2026-11-19: edge's first `git push` ran no hook build (0.02 GB); the
@@ -428,8 +437,8 @@ class Run(unittest.TestCase):
         self.assertEqual(runner.default_cap(peak, source, runs=1), 11.0)
         self.assertEqual(runner.default_cap(peak, source, runs=2), 11.0)
         peak3, source3 = pol.estimate_peak(None, [0.02, 5.9, 5.8])
-        self.assertEqual(runner.default_cap(peak3, source3, runs=3), 10.2)
-        self.assertEqual(runner.default_cap(2.0, "declared", runs=0), 4.0, "a declaration is believed at once")
+        self.assertEqual(runner.default_cap(peak3, source3, runs=3), 8.3)
+        self.assertEqual(runner.default_cap(2.0, "declared", runs=0), 3.5, "a declaration is believed at once")
         # The warm-up cap is a floor: a warming kind that already ran past it
         # keeps the calculated cap (persist's nextest, 14.1 GB, killed at 11).
         self.assertEqual(runner.default_cap(14.1, "learned (2 runs)", runs=2, declared=False), 14.0)
@@ -445,7 +454,7 @@ class Run(unittest.TestCase):
         self._seed("decl", 0.9)
         r = self.sched("run", "--kind", "decl", "--peak", "0.8", "--wait", "60", "--", "true")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self._last_history()["cap_gb"], 3.0, r.stderr)
+        self.assertEqual(self._last_history()["cap_gb"], 2.5, r.stderr)
 
     def test_a_warming_kind_stays_in_the_heavy_slot(self):
         # Codex on #6: one quiet run (0.02 GB) rounded the estimate to 0 GB, so
