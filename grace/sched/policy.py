@@ -125,6 +125,7 @@ def decide(
     machine: Machine,
     policy: Policy = Policy(),
     reserved_for: Optional[str] = None,
+    reserved_exclusive: bool = False,
     now: float = 0.0,
 ) -> Decision:
     d = Decision()
@@ -168,6 +169,12 @@ def decide(
             d.waits[r.id] = f"{count} jobs running, the most this box runs at once"
             continue
         heavy = r.heavy(policy)
+        # An EXCLUSIVE reservation (a release certify): nothing of another owner
+        # starts, light work included; running jobs drain and the owner's own
+        # jobs are admitted by the ordinary memory rules.
+        if reserved_exclusive and reserved_for and r.owner != reserved_for:
+            d.waits[r.id] = f"the box is reserved for {reserved_for} (exclusive): waiting for it to release"
+            continue
         if heavy and critical_waiting is not None and r.priority != "critical":
             d.waits[r.id] = (
                 f"behind the critical {critical_waiting.owner}:{critical_waiting.kind}: no other "

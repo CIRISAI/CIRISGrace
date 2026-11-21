@@ -186,6 +186,19 @@ class Policy(unittest.TestCase):
         self.assertEqual(pol.decide([crit], light, pol.Machine(17.0, BIG_DISK), P2).start, [],
                          "its cap plus half the floor must still fit beside the light job")
 
+    def test_an_exclusive_reservation_holds_back_every_other_owner(self):
+        # 2026-11-21: persist's certify needs the box free of foreign cargo; a
+        # heavy-slot reservation still let light jobs backfill, so it waited forever.
+        light = pol.Request("l", "CIRISClient", "gates", 1.0, budget_gb=2.0)
+        heavy = pol.Request("h", "edge", "test", 8.0, budget_gb=10.0)
+        own = pol.Request("p", "persist", "certify", 8.0, "critical", budget_gb=10.0)
+        d = pol.decide([light, heavy, own], [], pol.Machine(28, BIG_DISK), P2,
+                       reserved_for="persist", reserved_exclusive=True)
+        self.assertEqual(d.start, ["p"])
+        self.assertIn("reserved for persist (exclusive)", d.waits["l"])
+        shared = pol.decide([light], [], pol.Machine(28, BIG_DISK), P2, reserved_for="persist")
+        self.assertEqual(shared.start, ["l"], "a plain reservation still lets light work backfill")
+
     def test_a_waiting_critical_job_holds_back_other_heavy_starts(self):
         # Eric 2026-11-20: persist's critical lane waited ten minutes while an
         # edge test lane held the memory. Once a critical heavy job waits,
