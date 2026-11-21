@@ -179,6 +179,8 @@ def _main(argv: List[str] | None = None) -> int:
     rs = sub.add_parser("reserve", help="promise the heavy slot to one owner")
     rs.add_argument("owner")
     rs.add_argument("--minutes", type=float, default=30)
+    rs.add_argument("--exclusive", action="store_true",
+                    help="no other owner's job starts at all, light ones included (a certify run)")
     sub.add_parser("unreserve")
     h = sub.add_parser("history")
     h.add_argument("--kind", default=None)
@@ -194,8 +196,10 @@ def _main(argv: List[str] | None = None) -> int:
         return cmd_doctor(a)
     if a.cmd == "reserve":
         with state.locked() as d:
-            v = state.reserve(d, a.owner, a.minutes, by=os.environ.get("GRACE_SCHED_OWNER", Path.cwd().name))
-        print(f"the heavy slot is promised to {v['owner']} for {a.minutes:g} min")
+            v = state.reserve(d, a.owner, a.minutes, by=os.environ.get("GRACE_SCHED_OWNER", Path.cwd().name),
+                              exclusive=a.exclusive)
+        what = "the box" if a.exclusive else "the heavy slot"
+        print(f"{what} is promised to {v['owner']} for {a.minutes:g} min")
         return 0
     if a.cmd == "unreserve":
         with state.locked() as d:

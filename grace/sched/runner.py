@@ -120,7 +120,8 @@ def tick(d) -> pol.Decision:
     state.reap(d)
     res = state.reservation(d)
     dec = pol.decide(queue_view(d), running_view(d), machine(d), policy_from_env(),
-                     reserved_for=(res or {}).get("owner"), now=time.time())
+                     reserved_for=(res or {}).get("owner"),
+                     reserved_exclusive=bool((res or {}).get("exclusive")), now=time.time())
     for v in state.entries(d, "queue"):
         why = dec.waits.get(v["id"])
         if why and v.get("waiting_for") != why:
