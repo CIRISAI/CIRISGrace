@@ -79,7 +79,8 @@ def cmd_status(a) -> int:
           f"{s['disk_free_gb']} GB disk free")
     if s["reservation"]:
         r = s["reservation"]
-        print(f"reserved: the heavy slot is promised to {r['owner']} for "
+        what = "the box (exclusive)" if r.get("exclusive") else "the heavy slot"
+        print(f"reserved: {what} is promised to {r['owner']} for "
               f"{max(0, int((r['until'] - time.time()) / 60))} more min (by {r.get('by')})")
     print("running:" if s["running"] else "running: nothing")
     for r in s["running"]:
