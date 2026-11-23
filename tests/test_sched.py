@@ -171,9 +171,135 @@ class Policy(unittest.TestCase):
         self.assertEqual(pol.decide([lone], [], pol.Machine(22.0, BIG_DISK), P2).start, ["n"])
         self.assertEqual(pol.decide([lone], [], pol.Machine(18.0, BIG_DISK), P2).start, [],
                          "its cap plus half the floor (4 GB for the sessions) must still fit")
-        other = [pol.Running("r", "edge", "check", 2.0, 1.0, budget_gb=3.0)]
-        self.assertEqual(pol.decide([lone], other, pol.Machine(22.0, BIG_DISK), P2).start, [],
-                         "beside a running job the floor still applies")
+        heavy = [pol.Running("r", "edge", "check", 6.0, 1.0, budget_gb=9.0)]
+        self.assertEqual(pol.decide([lone], heavy, pol.Machine(30.0, BIG_DISK), P2).start, [],
+                         "beside a running HEAVY job the full floor still applies")
+
+    def test_a_light_job_beside_does_not_end_idle(self):
+        # 2026-11-21: a 2 GB client localize task (using 0.02 GB) held persist's
+        # critical clippy: 13.2 + the 8 GB floor = 21.2 GB against 21.0 free.
+        # The light job's memory is already reserved; only a heavy job ends idle.
+        crit = pol.Request("p", "persist", "clippy", 13.2, "critical", budget_gb=14.0)
+        light = [pol.Running("l", "CIRISClient", "localize", 0.02, 1.0, budget_gb=2.0)]
+        d = pol.decide([crit], light, pol.Machine(21.0, BIG_DISK), P2)
+        self.assertEqual(d.start, ["p"], d.waits)
+        self.assertEqual(pol.decide([crit], light, pol.Machine(17.0, BIG_DISK), P2).start, [],
+                         "its cap plus half the floor must still fit beside the light job")
+
+    def test_a_small_job_waits_on_half_the_floor_beside_a_heavy_one(self):
+        # 2026-11-22: persist's sqlite lane (declared 3 GB, measured 0.1-0.24)
+        # waited behind an edge test that reserved 9.2 GB and used 1.9: 6.0 GB
+        # projected free against 3.0 + the 8 GB floor.
+        edge = [pol.Running("e", "edge", "test", 9.2, 1.9, budget_gb=9.2)]
+        box = pol.Machine(13.3, BIG_DISK)  # 13.3 - 7.3 headroom = 6.0 projected
+        small = pol.Request("s", "persist", "sqlite-lib", 0.5, budget_gb=4.5, small=True)
+        self.assertEqual(pol.decide([small], edge, box, P2).start, ["s"])
+        unsmall = pol.Request("u", "persist", "sqlite-lib", 0.5, budget_gb=4.5)
+        self.assertEqual(pol.decide([unsmall], edge, box, P2).start, [],
+                         "the same job without its measured history keeps the full floor")
+        tight = pol.Machine(11.0, BIG_DISK)  # 3.7 projected: its 4.5 GB cap no longer fits
+        self.assertEqual(pol.decide([small], edge, tight, P2).start, [],
+                         "a small job's cap must still fit")
+
+    def test_a_job_past_its_peak_gives_back_its_headroom(self):
+        # 2026-11-22: edge's 45.1.10 lib test held its 9.2 GB reservation at
+        # 2.5 GB used for 17 min after linking; four jobs waited behind it.
+        p = pol.Policy()
+        self.assertIsNone(pol.reclaim(9.2, 2.5, 2.5, 0.0, 999.0, p), "never reached its peak")
+        self.assertIsNone(pol.reclaim(9.2, 6.0, 8.5, 0.0, 999.0, p), "not settled under half its max")
+        self.assertIsNone(pol.reclaim(9.2, 2.5, 8.5, 900.0, 999.0, p), "settled for less than settle_secs")
+        self.assertEqual(pol.reclaim(9.2, 2.5, 8.5, 0.0, 999.0, p), 4.0, "used + 1.5 GB")
+        self.assertEqual(pol.reclaim(9.2, 3.0, 8.0, 0.0, 999.0, p), 4.5)
+        self.assertEqual(pol.reclaim(2.5, 1.2, 2.4, 0.0, 999.0, p), 2.5, "never above the estimate")
+        # Its smaller reservation is what admission sees, and it no longer holds a heavy slot.
+        edge = pol.Running("e", "edge", "test", 9.2, 2.5, budget_gb=9.2, reclaimed_gb=4.0)
+        self.assertAlmostEqual(edge.headroom_gb(), 1.5)
+        self.assertFalse(edge.heavy(p))
+        waiting = pol.Request("v", "verify", "commit", 2.0, budget_gb=3.5)
+        held = pol.Running("e", "edge", "test", 9.2, 2.5, budget_gb=9.2)
+        box = pol.Machine(15.0, BIG_DISK)
+        self.assertEqual(pol.decide([waiting], [held], box, P2).start, [], "before: 15 - 6.7 = 8.3 < 10")
+        self.assertEqual(pol.decide([waiting], [edge], box, P2).start, ["v"], "after: 15 - 1.5 = 13.5")
+
+    def test_a_small_job_backfills_past_a_starving_head(self):
+        head = pol.Request("h", "persist", "seam-check", 8.0, budget_gb=9.5, created=0)
+        small = pol.Request("s", "verify", "cargo test", 0.5, budget_gb=2.0, created=10, small=True)
+        big = pol.Request("b", "edge", "clippy", 5.0, budget_gb=7.0, created=20)
+        box = pol.Machine(10.0, BIG_DISK)
+        d = pol.decide([head, small, big], [], box, P2, now=P2.starve_secs + 100)
+        self.assertNotIn("h", d.start, "the head still cannot fit")
+        self.assertIn("s", d.start, d.waits)
+        self.assertIn("nothing passes it now", d.waits["b"])
+
+    def test_memory_pressure_holds_every_start(self):
+        light = pol.Request("l", "CIRISClient", "gates", 1.0, budget_gb=2.0)
+        calm = pol.Machine(28, BIG_DISK, psi_some_avg10=2.0)
+        self.assertEqual(pol.decide([light], [], calm, P2).start, ["l"])
+        stalled = pol.Machine(28, BIG_DISK, psi_some_avg10=25.0)
+        d = pol.decide([light], [], stalled, P2)
+        self.assertEqual(d.start, [])
+        self.assertIn("memory pressure", d.waits["l"])
+
+    def test_cpu_pressure_holds_a_second_job_not_the_first(self):
+        # 2026-11-23: load 34 on 32 cores; a second build only splits the cores.
+        busy = pol.Machine(28, BIG_DISK, cpu_psi_some_avg10=40.0)
+        running = [pol.Running("r", "edge", "itest", peak_gb=7, used_gb=7)]
+        d = pol.decide([req("b", 3, created=100)], running, busy, P2, now=200)
+        self.assertEqual(d.start, [])
+        self.assertIn("cpu:", d.waits["b"])
+        # Nothing scheduled runs: the box is never idled by outside load.
+        self.assertEqual(pol.decide([req("b", 3)], [], busy, P2).start, ["b"])
+        # Calm cores: it starts.
+        calm = pol.Machine(28, BIG_DISK, cpu_psi_some_avg10=10.0)
+        self.assertEqual(pol.decide([req("b", 3)], running, calm, P2).start, ["b"])
+
+    def test_cpu_pressure_passes_critical_small_and_starving_jobs(self):
+        busy = pol.Machine(28, BIG_DISK, cpu_psi_some_avg10=40.0)
+        running = [pol.Running("r", "edge", "itest", peak_gb=7, used_gb=7)]
+        crit = req("c", 3, prio="critical", created=100)
+        self.assertEqual(pol.decide([crit], running, busy, P2, now=200).start, ["c"])
+        small = pol.Request("s", "verify", "hook", 0.3, budget_gb=1.0, created=100, small=True)
+        self.assertEqual(pol.decide([small], running, busy, P2, now=200).start, ["s"])
+        old = req("o", 3, created=0)
+        self.assertEqual(pol.decide([old], running, busy, P2, now=P2.starve_secs + 1).start, ["o"])
+
+    def test_the_default_floor_is_six(self):
+        # 2026-11-23: 3 GB critical + 8 = 11 against 10.3 projected held it 15 min.
+        self.assertEqual(pol.Policy().floor_gb, 6.0)
+        running = [pol.Running("r", "edge", "join", peak_gb=6.9, used_gb=1.6)]
+        crit = pol.Request("p", "persist", "lock-update", 3.0, "critical", budget_gb=4.5)
+        box = pol.Machine(15.6, BIG_DISK)  # 15.6 - 5.3 headroom = 10.3 projected
+        self.assertEqual(pol.decide([crit], running, box, pol.Policy()).start, ["p"])
+
+    def test_is_small_needs_three_measured_runs_all_small(self):
+        self.assertFalse(pol.is_small([0.1, 0.2]), "two runs are not a measurement")
+        self.assertTrue(pol.is_small([0.1, 0.2, 0.24]))
+        self.assertFalse(pol.is_small([0.1, 0.2, 1.7]), "one big recent run ends it")
+        self.assertTrue(pol.is_small([5.0, 0.1, 0.1, 0.1, 0.1, 0.1]), "only the last five count")
+
+    def test_a_declaration_is_learned_below_after_three_runs(self):
+        self.assertEqual(pol.estimate_peak(3.0, [0.1, 0.2]), (3.0, "declared"),
+                         "two runs do not move a declaration")
+        peak, source = pol.estimate_peak(3.0, [0.11, 0.17, 0.24])
+        self.assertEqual(peak, 0.5, "never below LEARNED_MIN_GB")
+        self.assertIn("below the declared 3", source)
+        peak, _ = pol.estimate_peak(8.0, [4.0, 5.0, 6.0])
+        self.assertEqual(peak, 6.9, "learned at the measured peak x1.15")
+        self.assertEqual(pol.estimate_peak(2.0, [1.9, 1.9, 1.9]),
+                         (2.2, "learned (3 runs, above the declared 2)"))
+
+    def test_an_exclusive_reservation_holds_back_every_other_owner(self):
+        # 2026-11-21: persist's certify needs the box free of foreign cargo; a
+        # heavy-slot reservation still let light jobs backfill, so it waited forever.
+        light = pol.Request("l", "CIRISClient", "gates", 1.0, budget_gb=2.0)
+        heavy = pol.Request("h", "edge", "test", 8.0, budget_gb=10.0)
+        own = pol.Request("p", "persist", "certify", 8.0, "critical", budget_gb=10.0)
+        d = pol.decide([light, heavy, own], [], pol.Machine(28, BIG_DISK), P2,
+                       reserved_for="persist", reserved_exclusive=True)
+        self.assertEqual(d.start, ["p"])
+        self.assertIn("reserved for persist (exclusive)", d.waits["l"])
+        shared = pol.decide([light], [], pol.Machine(28, BIG_DISK), P2, reserved_for="persist")
+        self.assertEqual(shared.start, ["l"], "a plain reservation still lets light work backfill")
 
     def test_a_waiting_critical_job_holds_back_other_heavy_starts(self):
         # Eric 2026-11-20: persist's critical lane waited ten minutes while an
@@ -390,11 +516,23 @@ class Run(unittest.TestCase):
         unit = "grace-sched-" + json.loads(Path(self.tmp.name, "events.jsonl").read_text().splitlines()[0])["id"]
         self.assertEqual(probe.unit_result(unit + ".scope"), "success", "its own failed unit is reset")
 
+    def test_a_measured_10_gb_build_starts_on_a_15_5_gb_idle_box(self):
+        # 2026-11-21: persist's sqlite lib-test build (need ~9.9 GB, estimate 10.5)
+        # was capped at 14 GB, so an idle box needed 14 + 4 = 18 GB and it never ran.
+        from grace.sched import runner
+        cap = runner.default_cap(10.5, "declared")
+        self.assertEqual(cap, 12.1)
+        req = pol.Request("p", "persist", "nextest", 10.5, "critical", budget_gb=cap)
+        self.assertEqual(pol.decide([req], [], pol.Machine(15.5, BIG_DISK), P2).start, ["p"])
+
     def test_an_unknown_job_keeps_the_legacy_guards_cap(self):
         from grace.sched import runner
         self.assertEqual(runner.default_cap(6.0, "default (no declaration, no history)"), 11.0)
-        self.assertEqual(runner.default_cap(2.0, "declared"), 4.0)
-        self.assertEqual(runner.default_cap(12.0, "learned (3 runs)", runs=3), 14.0)
+        self.assertEqual(runner.default_cap(2.0, "declared"), 3.5)
+        # A peak learned BELOW its declaration lowers admission, never the cap.
+        peak, source, cap = runner.plan(3.0, [0.11, 0.17, 0.24])
+        self.assertEqual((peak, cap), (0.5, runner.default_cap(3.0, "declared")), source)
+        self.assertEqual(runner.default_cap(12.0, "learned (3 runs)", runs=3), 13.8)
 
     def test_one_quiet_run_does_not_shrink_an_undeclared_cap(self):
         # 2026-11-19: edge's first `git push` ran no hook build (0.02 GB); the
@@ -404,8 +542,8 @@ class Run(unittest.TestCase):
         self.assertEqual(runner.default_cap(peak, source, runs=1), 11.0)
         self.assertEqual(runner.default_cap(peak, source, runs=2), 11.0)
         peak3, source3 = pol.estimate_peak(None, [0.02, 5.9, 5.8])
-        self.assertEqual(runner.default_cap(peak3, source3, runs=3), 10.2)
-        self.assertEqual(runner.default_cap(2.0, "declared", runs=0), 4.0, "a declaration is believed at once")
+        self.assertEqual(runner.default_cap(peak3, source3, runs=3), 8.3)
+        self.assertEqual(runner.default_cap(2.0, "declared", runs=0), 3.5, "a declaration is believed at once")
         # The warm-up cap is a floor: a warming kind that already ran past it
         # keeps the calculated cap (persist's nextest, 14.1 GB, killed at 11).
         self.assertEqual(runner.default_cap(14.1, "learned (2 runs)", runs=2, declared=False), 14.0)
@@ -421,7 +559,7 @@ class Run(unittest.TestCase):
         self._seed("decl", 0.9)
         r = self.sched("run", "--kind", "decl", "--peak", "0.8", "--wait", "60", "--", "true")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self._last_history()["cap_gb"], 3.0, r.stderr)
+        self.assertEqual(self._last_history()["cap_gb"], 2.5, r.stderr)
 
     def test_a_warming_kind_stays_in_the_heavy_slot(self):
         # Codex on #6: one quiet run (0.02 GB) rounded the estimate to 0 GB, so

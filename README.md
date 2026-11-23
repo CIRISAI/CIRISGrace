@@ -66,8 +66,8 @@ The rules, each from a real incident (see `grace/sched/policy.py`):
 | A slot is a lease (pid + start time), not an open file | A child that inherited the legacy guard's flock held its slot for an hour |
 | Children start with no inherited descriptors | The same leak, closed at the source |
 | Admit on *projected* memory: available now minus the headroom running jobs still grow into | Granting on `free -g` overcommitted three jobs and the reaper killed one |
-| One heavy job (above 4 GB) at a time; light work fills in around it | Two heavy builds at once took whole terminal scopes |
-| An 8 GB floor stays free after every admitted peak | The agents, browsers and databases live there |
+| At most two heavy jobs (above 4 GB) at once, each hard-capped; light work fills in around them (`GRACE_SCHED_MAX_HEAVY=1` restores one) | Two uncapped heavy builds took whole terminal scopes; capped, the memory budget keeps them apart |
+| A 6 GB floor stays free after every admitted peak (8 until 2026-11-23) | The agents, browsers and databases live there |
 | A disk floor (30 GB) | The disk filled to 75 MB and every session's writes failed |
 | Peaks are learned from the scope's own `memory.peak` | A 4.9 GB spike under a 4 GB grant slipped past a 1 s poll |
 | A cap kill is recorded at the cap | The next estimate learns the job needs more |
@@ -84,11 +84,40 @@ The rules, each from a real incident (see `grace/sched/policy.py`):
 | The scheduler changes nothing outside its job's scope | It once marked the caller's whole unit OOM-avoid |
 | A job with no declaration and no history keeps the legacy guard's 11 GB cap | A build that fitted under the old guard must not die on its first run here |
 | While sessions migrate, a heavy job also holds the legacy guard's free slot locks | An old copy of the guard cannot see this scheduler's jobs |
+| An idle box (no heavy job running) admits on cap + floor/4 or peak + floor/2 | The full floor on a lone capped job held a 14 GB build off a 22 GB free box |
+| A waiting critical heavy job holds back other heavy starts | A normal test lane took the memory persist's critical build was waiting for |
+| An exclusive reservation stops every other owner's starts; running jobs drain | A release certify needs the box to itself |
+| After 3 measured runs a kind's estimate may go *below* its declaration (not under 0.5 GB); the cap keeps the declaration | Declared 10 GB jobs that needed 0.2 GB waited behind the floor |
+| A small job (needs 1 GB or less on each of its last runs) needs only half the floor, even beside a heavy job, and may pass a starving head | Commit hooks and 0.3 GB tests waited 7-30 min behind one 9.5 GB lane |
+| Reclaim: a job that reached 70% of its estimate, then held under half its maximum for 120 s, reserves only max(used x1.3, used + 1.5 GB); its cap is unchanged | A linked test held a 9.2 GB reservation at 2.5 GB used for 17 min |
+| Nothing starts while memory pressure (PSI `some avg10`) is above 10% | A static floor guesses at pressure; PSI measures it |
+| While CPU pressure (PSI `some avg10`) is above 25% and a scheduled job runs, a further normal job waits; critical, small and starving jobs pass, and an empty schedule never waits | At load 34 on 32 cores a second build only splits the cores |
 
 State lives in `/run/user/<uid>/grace-sched` (else `/tmp/grace-sched-<uid>`; `$GRACE_SCHED_DIR` overrides), refused unless it is a real directory owned by you and closed to others: plain JSON you can
 `cat`. Knobs: `GRACE_SCHED_FLOOR_GB`, `GRACE_SCHED_HEAVY_GB`,
-`GRACE_SCHED_DISK_FLOOR_GB`, `GRACE_SCHED_MAX_RUNNING`, `GRACE_SCHED_STARVE_SECS`.
+`GRACE_SCHED_DISK_FLOOR_GB`, `GRACE_SCHED_MAX_RUNNING`, `GRACE_SCHED_STARVE_SECS`,
+`GRACE_SCHED_PSI_MAX` (memory pressure gate, %), `GRACE_SCHED_CPU_PSI_MAX` (CPU gate, %).
 Defaults for a build: `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=2`.
+
+### Compared with other schedulers
+
+`grace sched` is a single-box admission controller. Each rule above borrows
+from a larger system, cut down to one machine and a handful of sessions:
+
+| Idea | Where it comes from | What grace keeps, and what it drops |
+|---|---|---|
+| Admit on a reservation, enforce a hard cap | Kubernetes requests/limits | Request = learned estimate, limit = the scope's `MemoryMax`. No per-pod QoS classes; priority is three words |
+| Learn the reservation from measured use | Kubernetes VPA, Borg's usage-based estimates | Learns from each scope's own `memory.peak`, keyed by job kind; may learn below a declaration only after 3 runs |
+| Give back headroom a job no longer uses | Borg reservation reclamation | Only after the job has peaked and settled; the cap never shrinks, so a regrowing job is killed at its cap, not overcommitted |
+| Let short jobs pass a blocked head | Slurm backfill | Without runtimes to plan on, "short" is "small" (memory need of 1 GB or less, measured) |
+| Gate on measured pressure, not a static number | Meta oomd/senpai (PSI); Kubernetes KEP-5394 (PSI node conditions, alpha) | Only ever holds a *start*; never kills or throttles a running job |
+| Hold a start while the CPU is saturated | `make -l` / `ninja -l`, HTCondor `START` on `LoadAvg`, GNU parallel `--load` | Uses CPU PSI rather than load average (load counts I/O waits and lags a minute); like `make -l`, it never holds the first job |
+| Keep free memory for the rest of the box | GNU parallel `--memfree`, systemd `MemoryMin` on other units | A fixed floor plus the PSI gate, because the box's other residents (agents, browsers, databases) are not under the scheduler |
+
+Not borrowed, on purpose: preemption (Borg, Slurm, parallel's
+`--memfree` kill-and-requeue). A killed Rust build loses its whole compile, so
+grace waits rather than evicts. `memory.high` soft limits (throttling a job
+before the cap kills it) and I/O admission are the open items.
 
 ## Where the set comes from
 

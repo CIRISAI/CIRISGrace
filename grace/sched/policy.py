@@ -46,7 +46,11 @@ PRIORITIES = ("critical", "normal", "low")
 
 @dataclass(frozen=True)
 class Policy:
-    floor_gb: float = 8.0
+    #: 6 GB, down from 8 (Eric, 2026-11-23): with the box's outside load (TLC
+    #: model checks run by hand) moved under the scheduler its figures are real,
+    #: the PSI gate backs it, and at 8 a 3 GB critical job waited 15 min 0.7 GB
+    #: short. Swap is often full here, so the floor is the only spare: not lower.
+    floor_gb: float = 6.0
     heavy_gb: float = 4.0
     disk_floor_gb: float = 30.0
     max_running: int = 4
@@ -56,6 +60,30 @@ class Policy:
     #: keeps them apart (Eric, 2026-11-20: persist's v62 push needs more than
     #: one heavy build at a time). 1 restores the old one-at-a-time rule.
     max_heavy: int = 2
+    #: RECLAIM (Borg's reservation reclamation, on one box): a running job that
+    #: has reached its peak and then stayed well under it gives back the
+    #: headroom it no longer needs. It must have reached `reach_fraction` of
+    #: its estimated peak (the build's link step, say), and then held at or
+    #: under `settle_fraction` of that maximum for `settle_secs`. Its
+    #: reservation drops to max(used x1.3, used + 1.5 GB). Its hard CAP does
+    #: not change, so the job can still grow; the PSI gate below and the floor
+    #: are what cover that (edge's 45.1.10 lib test held 9.2 GB at 2.5 GB used
+    #: for 17 min after linking while four jobs waited, 2026-11-22).
+    reach_fraction: float = 0.7
+    settle_fraction: float = 0.5
+    settle_secs: float = 120.0
+    #: PSI GATE: nothing starts while the box's memory pressure (the share of
+    #: the last 10 s some task stalled on memory, /proc/pressure/memory "some
+    #: avg10", in %) is above this. A static floor guesses at pressure; PSI
+    #: measures it (Meta's oomd/senpai). It only ever holds a start back.
+    psi_max: float = 10.0
+    #: CPU GATE: while the box's CPU pressure (/proc/pressure/cpu "some avg10",
+    #: %) is above this and a scheduled job already runs, a further job waits:
+    #: on saturated cores a second build only splits them and both finish
+    #: later (load 34 on 32 cores, 2026-11-23). It never holds a job on a box
+    #: with nothing scheduled running, a critical job, a small job, or one that
+    #: has waited `starve_secs`. A box at load 34/32 read 10-12%.
+    cpu_psi_max: float = 25.0
 
 
 @dataclass(frozen=True)
@@ -68,6 +96,9 @@ class Request:
     created: float = 0.0
     #: what admission reserves: the job's hard cap (default: the estimate)
     budget_gb: Optional[float] = None
+    #: a SMALL job: its measured need stayed at or under SMALL_GB over its last
+    #: runs (see `is_small`), so it is admitted against half the floor
+    small: bool = False
 
     def heavy(self, p: Policy) -> bool:
         return self.peak_gb > p.heavy_gb
@@ -87,19 +118,46 @@ class Running:
     budget_gb: Optional[float] = None
     #: no memory limit at all: it may grow into everything available
     uncapped: bool = False
+    #: the reservation this job keeps after RECLAIM (see Policy), or None
+    reclaimed_gb: Optional[float] = None
+
+    def effective_peak(self) -> float:
+        return self.peak_gb if self.reclaimed_gb is None else min(self.peak_gb, self.reclaimed_gb)
 
     def heavy(self, p: Policy) -> bool:
-        return self.peak_gb > p.heavy_gb
+        return self.effective_peak() > p.heavy_gb
 
     def headroom_gb(self) -> float:
-        """What this job may still grow into before its cap stops it."""
+        """What this job may still grow into before its reservation is used.
+        Its cap, or after RECLAIM the smaller reservation it settled to."""
+        if self.reclaimed_gb is not None:
+            return max(0.0, self.reclaimed_gb - self.used_gb)
         return max(0.0, max(self.peak_gb, self.budget_gb or 0.0) - self.used_gb)
+
+
+def reclaim(peak_gb: float, used_gb: float, max_used_gb: float, settled_since: Optional[float],
+            now: float, policy: "Policy") -> Optional[float]:
+    """The reservation a running job settles to after its peak, or None while
+    it has not (see Policy.reach_fraction). Never above its estimated peak."""
+    if settled_since is None or peak_gb <= 0:
+        return None
+    if max_used_gb < policy.reach_fraction * peak_gb:
+        return None
+    if used_gb > policy.settle_fraction * max_used_gb:
+        return None
+    if now - settled_since < policy.settle_secs:
+        return None
+    return round(min(peak_gb, max(used_gb * 1.3, used_gb + 1.5)), 2)
 
 
 @dataclass(frozen=True)
 class Machine:
     available_gb: float
     disk_free_gb: float
+    #: /proc/pressure/memory "some avg10" (%), 0 where the kernel has no PSI
+    psi_some_avg10: float = 0.0
+    #: /proc/pressure/cpu "some avg10" (%), 0 where the kernel has no PSI
+    cpu_psi_some_avg10: float = 0.0
 
 
 @dataclass
@@ -125,6 +183,7 @@ def decide(
     machine: Machine,
     policy: Policy = Policy(),
     reserved_for: Optional[str] = None,
+    reserved_exclusive: bool = False,
     now: float = 0.0,
 ) -> Decision:
     d = Decision()
@@ -139,6 +198,14 @@ def decide(
     #: v62 is the critical path; an edge test lane started beside a waiting
     #: critical lane would hold its memory for ten minutes).
     critical_waiting: Optional[Request] = None
+
+    if machine.psi_some_avg10 > policy.psi_max:
+        for r in queue:
+            d.waits[r.id] = (
+                f"memory pressure: tasks stalled on memory {machine.psi_some_avg10:.0f}% of the last "
+                f"10 s (over {policy.psi_max:.0f}%); waiting for it to ease"
+            )
+        return d
 
     if machine.disk_free_gb < policy.disk_floor_gb:
         for r in queue:
@@ -158,7 +225,13 @@ def decide(
         return d
 
     for r in order(queue):
-        if head_starving is not None:
+        # BACKFILL past a starving head (Slurm's idea, sized to this box): a
+        # SMALL job (measured need <= SMALL_GB on its last runs) may still
+        # start, because it takes too little to matter to the head and ends
+        # soon. Everything else waits behind the head. One 9.5 GB lane that
+        # could not fit held five jobs for 30+ min, two of them commit hooks
+        # and a 0.3 GB test (2026-11-22).
+        if head_starving is not None and not r.small:
             d.waits[r.id] = (
                 f"behind {head_starving.owner}:{head_starving.kind}, which has waited "
                 f"{(now - head_starving.created) / 60:.0f} min; nothing passes it now"
@@ -167,7 +240,21 @@ def decide(
         if count >= policy.max_running:
             d.waits[r.id] = f"{count} jobs running, the most this box runs at once"
             continue
+        if (machine.cpu_psi_some_avg10 > policy.cpu_psi_max and count > 0
+                and r.priority != "critical" and not r.small
+                and now - r.created < policy.starve_secs):
+            d.waits[r.id] = (
+                f"cpu: tasks waited on the cores {machine.cpu_psi_some_avg10:.0f}% of the last 10 s "
+                f"(over {policy.cpu_psi_max:.0f}%) with {count} job(s) running; waiting for cores"
+            )
+            continue
         heavy = r.heavy(policy)
+        # An EXCLUSIVE reservation (a release certify): nothing of another owner
+        # starts, light work included; running jobs drain and the owner's own
+        # jobs are admitted by the ordinary memory rules.
+        if reserved_exclusive and reserved_for and r.owner != reserved_for:
+            d.waits[r.id] = f"the box is reserved for {reserved_for} (exclusive): waiting for it to release"
+            continue
         if heavy and critical_waiting is not None and r.priority != "critical":
             d.waits[r.id] = (
                 f"behind the critical {critical_waiting.owner}:{critical_waiting.kind}: no other "
@@ -199,8 +286,26 @@ def decide(
         # more than the ordinary rule. On an empty box, the full floor on top
         # of a margin-inflated peak held persist's lib nextest forever (14.4 +
         # 8 = 22.4 GB against 22.0 free, nothing running, 2026-11-20).
-        if not running and not d.start:
-            need = min(need, r.budget() + policy.floor_gb / 2)
+        # A LIGHT job beside it (at or under heavy_gb) does not end "idle": its
+        # memory is already reserved in `room`, and it cannot grow past its
+        # cap. Only another heavy job does. A 2 GB localize task held persist's
+        # critical clippy (13.2 + 8 = 21.2 GB against 21.0 free) while it used
+        # 0.02 GB (2026-11-21).
+        # A SMALL job (measured need at or under SMALL_GB on each of its last
+        # LEARN_BELOW_RUNS runs): its cap must still fit, but its expected peak
+        # leaves only HALF the floor, even beside a heavy job. Four short jobs
+        # (persist's sqlite lane needing 0.1-0.24 GB, commit hooks) waited
+        # 7-17 min behind one edge test that had reserved 9.2 GB and was using
+        # 1.9 (2026-11-22). The full floor stays for everything else.
+        if r.small:
+            need = min(need, max(r.budget(), r.peak_gb + policy.floor_gb / 2))
+        if not any(j.heavy(policy) for j in running) and not heavy_holders:
+            # The cap plus a quarter of the floor (the worst case, the job at its
+            # cap), and the EXPECTED peak plus half the floor (the sessions beside
+            # it). Caps sit close to the measured peak (runner.default_cap), so
+            # the two agree within a couple of GB; cap + floor/2 alone held a
+            # measured 10 GB build off a 15.5 GB idle box (2026-11-21).
+            need = min(need, max(r.budget() + policy.floor_gb / 4, r.peak_gb + policy.floor_gb / 2))
         if room < need:
             d.waits[r.id] = (
                 f"memory: needs {r.budget():.1f} GB for its cap and {r.peak_gb:.1f} GB plus the "
@@ -223,6 +328,25 @@ def decide(
 #: The peak a job with no declaration and no history is admitted at.
 UNKNOWN_PEAK_GB = 6.0
 
+#: Measured runs before a kind's own history may set its estimate BELOW what
+#: its caller declared (and before it may count as a small job).
+LEARN_BELOW_RUNS = 3
+
+#: The least an estimate learned below a declaration goes to.
+LEARNED_MIN_GB = 0.5
+
+#: A job whose measured need stayed at or under this on each of its last
+#: LEARN_BELOW_RUNS runs is a small job (`Request.small`).
+SMALL_GB = 1.0
+
+
+def is_small(need_history_gb: List[float]) -> bool:
+    """Whether a kind's measured NEED (anonymous memory, not page cache) stayed
+    small on each of its last runs: at least LEARN_BELOW_RUNS of them, every
+    one of the last five at or under SMALL_GB."""
+    recent = need_history_gb[-5:]
+    return len(need_history_gb) >= LEARN_BELOW_RUNS and max(recent) <= SMALL_GB
+
 
 def estimate_peak(
     declared_gb: Optional[float],
@@ -241,6 +365,16 @@ def estimate_peak(
     if declared_gb is not None and seen is not None:
         if seen > declared_gb:
             return round(seen, 1), f"learned ({len(history_gb)} runs, above the declared {declared_gb:g})"
+        # Learned BELOW the declaration, once the kind has enough measured
+        # runs: a declaration is a caller's guess and the runs are the box's
+        # measurement. persist's sqlite lane was declared 3 GB and measured
+        # 0.1-0.24 GB on every run, and was admitted at 3 GB + the floor each
+        # time (2026-11-22). The CAP keeps the declaration (runner.plan), so a
+        # run that does grow is not killed early; only admission learns.
+        if len(history_gb) >= LEARN_BELOW_RUNS:
+            low = max(round(seen, 1), LEARNED_MIN_GB)
+            if low < declared_gb:
+                return low, f"learned ({len(history_gb)} runs, below the declared {declared_gb:g})"
         return float(declared_gb), "declared"
     if declared_gb is not None:
         return float(declared_gb), "declared"

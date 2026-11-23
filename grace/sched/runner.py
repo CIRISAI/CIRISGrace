@@ -62,8 +62,14 @@ def _say(msg: str) -> None:
     print(f"grace-sched: {msg}", file=sys.stderr, flush=True)
 
 
-def running_view(d) -> List[pol.Running]:
+def running_view(d, track: bool = False, now: Optional[float] = None) -> List[pol.Running]:
+    """The running jobs. With ``track`` (the scheduler's own tick, under the
+    mutex) each lease also records its largest anonymous use and since when it
+    has stayed settled under it, which RECLAIM reads; a read-only view leaves
+    the leases as they are."""
     out = []
+    now = time.time() if now is None else now
+    pol_now = policy_from_env()
     for v in state.entries(d, "leases"):
         used = None
         if v.get("cgroup"):
@@ -74,8 +80,21 @@ def running_view(d) -> List[pol.Running]:
                 used = probe.cgroup_gb(v["cgroup"])
         if used is None and v.get("pgid"):
             used = probe.rss_gb_of_group(int(v["pgid"]))
-        out.append(pol.Running(v["id"], v["owner"], v["kind"], float(v["peak_gb"]), float(used or 0.0),
-                               budget_gb=float(v.get("cap_gb") or v["peak_gb"])))
+        used_f = float(used or 0.0)
+        peak = float(v["peak_gb"])
+        max_used = max(float(v.get("max_used_gb") or 0.0), used_f)
+        settled = v.get("settled_since")
+        if used_f > pol_now.settle_fraction * max_used:
+            settled = None
+        elif settled is None:
+            settled = now
+        if track and (max_used != v.get("max_used_gb") or settled != v.get("settled_since")):
+            v["max_used_gb"] = round(max_used, 3)
+            v["settled_since"] = settled
+            state.put(d, "leases", v)
+        out.append(pol.Running(v["id"], v["owner"], v["kind"], peak, used_f,
+                               budget_gb=float(v.get("cap_gb") or v["peak_gb"]),
+                               reclaimed_gb=pol.reclaim(peak, used_f, max_used, settled, now, pol_now)))
     # Builds under the legacy cargo_guard.sh never asked this scheduler, but
     # they use the same memory. Each counts as a running job whose peak is
     # its own cap, until every session has moved over.
@@ -94,24 +113,29 @@ def running_view(d) -> List[pol.Running]:
 def queue_view(d) -> List[pol.Request]:
     return [
         pol.Request(v["id"], v["owner"], v["kind"], float(v["peak_gb"]), v.get("priority", "normal"),
-                    float(v.get("created", 0)), budget_gb=float(v.get("cap_gb") or v["peak_gb"]))
+                    float(v.get("created", 0)), budget_gb=float(v.get("cap_gb") or v["peak_gb"]),
+                    small=bool(v.get("small")))
         for v in state.entries(d, "queue")
     ]
 
 
 def machine(d) -> pol.Machine:
-    return pol.Machine(probe.available_gb(), probe.disk_free_gb(os.environ.get("GRACE_SCHED_DISK", "/")))
+    return pol.Machine(probe.available_gb(), probe.disk_free_gb(os.environ.get("GRACE_SCHED_DISK", "/")),
+                       probe.memory_pressure_some_avg10(), probe.cpu_pressure_some_avg10())
 
 
 def policy_from_env() -> pol.Policy:
     e = os.environ.get
     return pol.Policy(
-        floor_gb=float(e("GRACE_SCHED_FLOOR_GB", 8)),
+        floor_gb=float(e("GRACE_SCHED_FLOOR_GB", 6)),
         heavy_gb=float(e("GRACE_SCHED_HEAVY_GB", 4)),
         disk_floor_gb=float(e("GRACE_SCHED_DISK_FLOOR_GB", 30)),
         max_running=int(e("GRACE_SCHED_MAX_RUNNING", 4)),
         max_heavy=int(e("GRACE_SCHED_MAX_HEAVY", 2)),
         starve_secs=float(e("GRACE_SCHED_STARVE_SECS", 1800)),
+        settle_secs=float(e("GRACE_SCHED_SETTLE_SECS", 120)),
+        psi_max=float(e("GRACE_SCHED_PSI_MAX", 10)),
+        cpu_psi_max=float(e("GRACE_SCHED_CPU_PSI_MAX", 25)),
     )
 
 
@@ -119,8 +143,9 @@ def tick(d) -> pol.Decision:
     """One scheduling step, under the mutex: reclaim, decide, write reasons."""
     state.reap(d)
     res = state.reservation(d)
-    dec = pol.decide(queue_view(d), running_view(d), machine(d), policy_from_env(),
-                     reserved_for=(res or {}).get("owner"), now=time.time())
+    dec = pol.decide(queue_view(d), running_view(d, track=True), machine(d), policy_from_env(),
+                     reserved_for=(res or {}).get("owner"),
+                     reserved_exclusive=bool((res or {}).get("exclusive")), now=time.time())
     for v in state.entries(d, "queue"):
         why = dec.waits.get(v["id"])
         if why and v.get("waiting_for") != why:
@@ -175,7 +200,12 @@ def default_cap(peak: float, source: str = "declared", runs: int = 0,
     "learned" source, and it keeps the calculated cap (Codex on #6)."""
     if declared is None:
         declared = source.startswith("declared")
-    calculated = round(min(max(peak * 1.5, peak + 2.0), MAX_CAP_GB), 1)
+    # The peak already carries the estimate's 15% margin over the MEASURED need,
+    # so the cap adds only a little more: x1.15 or +1.5 GB, whichever is larger
+    # (about 1.3x the measured need). x1.5 on top of the margin gave every job
+    # above ~9 GB the full 14 GB cap, and on an idle box with ~15.5 GB free a
+    # 10 GB build then needed 14 + 4 = 18 GB and never started (persist, 2026-11-21).
+    calculated = round(min(max(peak * 1.15, peak + 1.5), MAX_CAP_GB), 1)
     if source.startswith("default") or (not declared and runs < LEARN_RUNS):
         # The warm-up cap is a floor, never a ceiling: a kind still warming up
         # whose runs already reached past it keeps the calculated cap (persist's
@@ -196,7 +226,12 @@ def plan(declared_gb: Optional[float], history_gb: List[float],
     peak, source = pol.estimate_peak(declared_gb, history_gb)
     runs = len(history_gb)
     declared = declared_gb is not None
-    cap = round(cap_gb, 1) if cap_gb else default_cap(peak, source, runs, declared=declared)
+    # A peak learned BELOW the declaration lowers admission only: the cap is
+    # still set from the declaration, so the job keeps the room its caller
+    # asked for if this run does grow.
+    cap_peak = max(peak, declared_gb) if declared else peak
+    cap_source = "declared" if declared and cap_peak > peak else source
+    cap = round(cap_gb, 1) if cap_gb else default_cap(cap_peak, cap_source, runs, declared=declared)
     if not declared and 0 < runs < LEARN_RUNS and peak < pol.UNKNOWN_PEAK_GB:
         peak = pol.UNKNOWN_PEAK_GB
         source += f", warming up ({LEARN_RUNS} runs to learn): admitted as an unknown job"
@@ -289,13 +324,15 @@ def run(argv: List[str], owner: str, kind: str, declared_gb: Optional[float],
             _say(f"{too_big}; refusing ({EXIT_TOO_BIG}). Pass --cap to run it at a cap you choose.")
             return EXIT_TOO_BIG
         me = os.getpid()
+        small = pol.is_small(state.history(d, kind, need_only=True))
         req = {"id": job_id, "owner": owner, "kind": kind, "peak_gb": peak, "peak_source": source,
-               "cap_gb": cap, "scoped": scoped,
+               "cap_gb": cap, "scoped": scoped, "small": small,
                "priority": priority, "created": time.time(), "pid": me,
                "pid_start": probe.start_time(me), "cmd": " ".join(argv)[:300], "cwd": os.getcwd()}
         state.put(d, "queue", req)
         state.event(d, "requested", id=job_id, owner=owner, kind=kind, peak_gb=peak, priority=priority)
-    _say(f"{job_id} queued: {owner}:{kind}, peak {peak:g} GB ({source}), cap {cap:g} GB, {priority}")
+    _say(f"{job_id} queued: {owner}:{kind}, peak {peak:g} GB ({source}), cap {cap:g} GB, {priority}"
+         + (", small (half the floor)" if small else ""))
 
     t0 = time.time()
     last_why = None

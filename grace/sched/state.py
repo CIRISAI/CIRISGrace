@@ -177,8 +177,8 @@ def reservation(d: Path) -> Optional[Dict[str, Any]]:
     return v
 
 
-def reserve(d: Path, owner: str, minutes: float, by: str) -> Dict[str, Any]:
-    v = {"owner": owner, "until": time.time() + minutes * 60, "by": by}
+def reserve(d: Path, owner: str, minutes: float, by: str, exclusive: bool = False) -> Dict[str, Any]:
+    v = {"owner": owner, "until": time.time() + minutes * 60, "by": by, "exclusive": exclusive}
     _write(d / "reservation.json", v)
     event(d, "reserved", **v)
     return v
