@@ -22,6 +22,12 @@ def available_gb() -> float:
     return 0.0
 
 
+def cpu_pressure_some_avg10(path: str = "/proc/pressure/cpu") -> float:
+    """The share (%) of the last 10 s in which some runnable task waited for a
+    core, or 0.0 where the kernel exposes no PSI."""
+    return memory_pressure_some_avg10(path)
+
+
 def memory_pressure_some_avg10(path: str = "/proc/pressure/memory") -> float:
     """The share (%) of the last 10 s in which some task stalled on memory, or
     0.0 where the kernel exposes no PSI (it then only never holds a start)."""

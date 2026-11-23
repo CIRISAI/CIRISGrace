@@ -46,7 +46,11 @@ PRIORITIES = ("critical", "normal", "low")
 
 @dataclass(frozen=True)
 class Policy:
-    floor_gb: float = 8.0
+    #: 6 GB, down from 8 (Eric, 2026-11-23): with the box's outside load (TLC
+    #: model checks run by hand) moved under the scheduler its figures are real,
+    #: the PSI gate backs it, and at 8 a 3 GB critical job waited 15 min 0.7 GB
+    #: short. Swap is often full here, so the floor is the only spare: not lower.
+    floor_gb: float = 6.0
     heavy_gb: float = 4.0
     disk_floor_gb: float = 30.0
     max_running: int = 4
@@ -73,6 +77,13 @@ class Policy:
     #: avg10", in %) is above this. A static floor guesses at pressure; PSI
     #: measures it (Meta's oomd/senpai). It only ever holds a start back.
     psi_max: float = 10.0
+    #: CPU GATE: while the box's CPU pressure (/proc/pressure/cpu "some avg10",
+    #: %) is above this and a scheduled job already runs, a further job waits:
+    #: on saturated cores a second build only splits them and both finish
+    #: later (load 34 on 32 cores, 2026-11-23). It never holds a job on a box
+    #: with nothing scheduled running, a critical job, a small job, or one that
+    #: has waited `starve_secs`. A box at load 34/32 read 10-12%.
+    cpu_psi_max: float = 25.0
 
 
 @dataclass(frozen=True)
@@ -145,6 +156,8 @@ class Machine:
     disk_free_gb: float
     #: /proc/pressure/memory "some avg10" (%), 0 where the kernel has no PSI
     psi_some_avg10: float = 0.0
+    #: /proc/pressure/cpu "some avg10" (%), 0 where the kernel has no PSI
+    cpu_psi_some_avg10: float = 0.0
 
 
 @dataclass
@@ -226,6 +239,14 @@ def decide(
             continue
         if count >= policy.max_running:
             d.waits[r.id] = f"{count} jobs running, the most this box runs at once"
+            continue
+        if (machine.cpu_psi_some_avg10 > policy.cpu_psi_max and count > 0
+                and r.priority != "critical" and not r.small
+                and now - r.created < policy.starve_secs):
+            d.waits[r.id] = (
+                f"cpu: tasks waited on the cores {machine.cpu_psi_some_avg10:.0f}% of the last 10 s "
+                f"(over {policy.cpu_psi_max:.0f}%) with {count} job(s) running; waiting for cores"
+            )
             continue
         heavy = r.heavy(policy)
         # An EXCLUSIVE reservation (a release certify): nothing of another owner

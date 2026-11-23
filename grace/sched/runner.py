@@ -121,13 +121,13 @@ def queue_view(d) -> List[pol.Request]:
 
 def machine(d) -> pol.Machine:
     return pol.Machine(probe.available_gb(), probe.disk_free_gb(os.environ.get("GRACE_SCHED_DISK", "/")),
-                       probe.memory_pressure_some_avg10())
+                       probe.memory_pressure_some_avg10(), probe.cpu_pressure_some_avg10())
 
 
 def policy_from_env() -> pol.Policy:
     e = os.environ.get
     return pol.Policy(
-        floor_gb=float(e("GRACE_SCHED_FLOOR_GB", 8)),
+        floor_gb=float(e("GRACE_SCHED_FLOOR_GB", 6)),
         heavy_gb=float(e("GRACE_SCHED_HEAVY_GB", 4)),
         disk_floor_gb=float(e("GRACE_SCHED_DISK_FLOOR_GB", 30)),
         max_running=int(e("GRACE_SCHED_MAX_RUNNING", 4)),
@@ -135,6 +135,7 @@ def policy_from_env() -> pol.Policy:
         starve_secs=float(e("GRACE_SCHED_STARVE_SECS", 1800)),
         settle_secs=float(e("GRACE_SCHED_SETTLE_SECS", 120)),
         psi_max=float(e("GRACE_SCHED_PSI_MAX", 10)),
+        cpu_psi_max=float(e("GRACE_SCHED_CPU_PSI_MAX", 25)),
     )
 
 

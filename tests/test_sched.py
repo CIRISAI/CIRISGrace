@@ -240,6 +240,37 @@ class Policy(unittest.TestCase):
         self.assertEqual(d.start, [])
         self.assertIn("memory pressure", d.waits["l"])
 
+    def test_cpu_pressure_holds_a_second_job_not_the_first(self):
+        # 2026-11-23: load 34 on 32 cores; a second build only splits the cores.
+        busy = pol.Machine(28, BIG_DISK, cpu_psi_some_avg10=40.0)
+        running = [pol.Running("r", "edge", "itest", peak_gb=7, used_gb=7)]
+        d = pol.decide([req("b", 3, created=100)], running, busy, P2, now=200)
+        self.assertEqual(d.start, [])
+        self.assertIn("cpu:", d.waits["b"])
+        # Nothing scheduled runs: the box is never idled by outside load.
+        self.assertEqual(pol.decide([req("b", 3)], [], busy, P2).start, ["b"])
+        # Calm cores: it starts.
+        calm = pol.Machine(28, BIG_DISK, cpu_psi_some_avg10=10.0)
+        self.assertEqual(pol.decide([req("b", 3)], running, calm, P2).start, ["b"])
+
+    def test_cpu_pressure_passes_critical_small_and_starving_jobs(self):
+        busy = pol.Machine(28, BIG_DISK, cpu_psi_some_avg10=40.0)
+        running = [pol.Running("r", "edge", "itest", peak_gb=7, used_gb=7)]
+        crit = req("c", 3, prio="critical", created=100)
+        self.assertEqual(pol.decide([crit], running, busy, P2, now=200).start, ["c"])
+        small = pol.Request("s", "verify", "hook", 0.3, budget_gb=1.0, created=100, small=True)
+        self.assertEqual(pol.decide([small], running, busy, P2, now=200).start, ["s"])
+        old = req("o", 3, created=0)
+        self.assertEqual(pol.decide([old], running, busy, P2, now=P2.starve_secs + 1).start, ["o"])
+
+    def test_the_default_floor_is_six(self):
+        # 2026-11-23: 3 GB critical + 8 = 11 against 10.3 projected held it 15 min.
+        self.assertEqual(pol.Policy().floor_gb, 6.0)
+        running = [pol.Running("r", "edge", "join", peak_gb=6.9, used_gb=1.6)]
+        crit = pol.Request("p", "persist", "lock-update", 3.0, "critical", budget_gb=4.5)
+        box = pol.Machine(15.6, BIG_DISK)  # 15.6 - 5.3 headroom = 10.3 projected
+        self.assertEqual(pol.decide([crit], running, box, pol.Policy()).start, ["p"])
+
     def test_is_small_needs_three_measured_runs_all_small(self):
         self.assertFalse(pol.is_small([0.1, 0.2]), "two runs are not a measurement")
         self.assertTrue(pol.is_small([0.1, 0.2, 0.24]))
