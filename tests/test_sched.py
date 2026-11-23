@@ -201,6 +201,35 @@ class Policy(unittest.TestCase):
         self.assertEqual(pol.decide([small], edge, tight, P2).start, [],
                          "a small job's cap must still fit")
 
+    def test_a_job_past_its_peak_gives_back_its_headroom(self):
+        # 2026-11-22: edge's 45.1.10 lib test held its 9.2 GB reservation at
+        # 2.5 GB used for 17 min after linking; four jobs waited behind it.
+        p = pol.Policy()
+        self.assertIsNone(pol.reclaim(9.2, 2.5, 2.5, 0.0, 999.0, p), "never reached its peak")
+        self.assertIsNone(pol.reclaim(9.2, 6.0, 8.5, 0.0, 999.0, p), "not settled under half its max")
+        self.assertIsNone(pol.reclaim(9.2, 2.5, 8.5, 900.0, 999.0, p), "settled for less than settle_secs")
+        self.assertEqual(pol.reclaim(9.2, 2.5, 8.5, 0.0, 999.0, p), 4.0, "used + 1.5 GB")
+        self.assertEqual(pol.reclaim(9.2, 3.0, 8.0, 0.0, 999.0, p), 4.5)
+        self.assertEqual(pol.reclaim(2.5, 1.2, 2.4, 0.0, 999.0, p), 2.5, "never above the estimate")
+        # Its smaller reservation is what admission sees, and it no longer holds a heavy slot.
+        edge = pol.Running("e", "edge", "test", 9.2, 2.5, budget_gb=9.2, reclaimed_gb=4.0)
+        self.assertAlmostEqual(edge.headroom_gb(), 1.5)
+        self.assertFalse(edge.heavy(p))
+        waiting = pol.Request("v", "verify", "commit", 2.0, budget_gb=3.5)
+        held = pol.Running("e", "edge", "test", 9.2, 2.5, budget_gb=9.2)
+        box = pol.Machine(15.0, BIG_DISK)
+        self.assertEqual(pol.decide([waiting], [held], box, P2).start, [], "before: 15 - 6.7 = 8.3 < 10")
+        self.assertEqual(pol.decide([waiting], [edge], box, P2).start, ["v"], "after: 15 - 1.5 = 13.5")
+
+    def test_memory_pressure_holds_every_start(self):
+        light = pol.Request("l", "CIRISClient", "gates", 1.0, budget_gb=2.0)
+        calm = pol.Machine(28, BIG_DISK, psi_some_avg10=2.0)
+        self.assertEqual(pol.decide([light], [], calm, P2).start, ["l"])
+        stalled = pol.Machine(28, BIG_DISK, psi_some_avg10=25.0)
+        d = pol.decide([light], [], stalled, P2)
+        self.assertEqual(d.start, [])
+        self.assertIn("memory pressure", d.waits["l"])
+
     def test_is_small_needs_three_measured_runs_all_small(self):
         self.assertFalse(pol.is_small([0.1, 0.2]), "two runs are not a measurement")
         self.assertTrue(pol.is_small([0.1, 0.2, 0.24]))

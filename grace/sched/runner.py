@@ -62,8 +62,14 @@ def _say(msg: str) -> None:
     print(f"grace-sched: {msg}", file=sys.stderr, flush=True)
 
 
-def running_view(d) -> List[pol.Running]:
+def running_view(d, track: bool = False, now: Optional[float] = None) -> List[pol.Running]:
+    """The running jobs. With ``track`` (the scheduler's own tick, under the
+    mutex) each lease also records its largest anonymous use and since when it
+    has stayed settled under it, which RECLAIM reads; a read-only view leaves
+    the leases as they are."""
     out = []
+    now = time.time() if now is None else now
+    pol_now = policy_from_env()
     for v in state.entries(d, "leases"):
         used = None
         if v.get("cgroup"):
@@ -74,8 +80,21 @@ def running_view(d) -> List[pol.Running]:
                 used = probe.cgroup_gb(v["cgroup"])
         if used is None and v.get("pgid"):
             used = probe.rss_gb_of_group(int(v["pgid"]))
-        out.append(pol.Running(v["id"], v["owner"], v["kind"], float(v["peak_gb"]), float(used or 0.0),
-                               budget_gb=float(v.get("cap_gb") or v["peak_gb"])))
+        used_f = float(used or 0.0)
+        peak = float(v["peak_gb"])
+        max_used = max(float(v.get("max_used_gb") or 0.0), used_f)
+        settled = v.get("settled_since")
+        if used_f > pol_now.settle_fraction * max_used:
+            settled = None
+        elif settled is None:
+            settled = now
+        if track and (max_used != v.get("max_used_gb") or settled != v.get("settled_since")):
+            v["max_used_gb"] = round(max_used, 3)
+            v["settled_since"] = settled
+            state.put(d, "leases", v)
+        out.append(pol.Running(v["id"], v["owner"], v["kind"], peak, used_f,
+                               budget_gb=float(v.get("cap_gb") or v["peak_gb"]),
+                               reclaimed_gb=pol.reclaim(peak, used_f, max_used, settled, now, pol_now)))
     # Builds under the legacy cargo_guard.sh never asked this scheduler, but
     # they use the same memory. Each counts as a running job whose peak is
     # its own cap, until every session has moved over.
@@ -101,7 +120,8 @@ def queue_view(d) -> List[pol.Request]:
 
 
 def machine(d) -> pol.Machine:
-    return pol.Machine(probe.available_gb(), probe.disk_free_gb(os.environ.get("GRACE_SCHED_DISK", "/")))
+    return pol.Machine(probe.available_gb(), probe.disk_free_gb(os.environ.get("GRACE_SCHED_DISK", "/")),
+                       probe.memory_pressure_some_avg10())
 
 
 def policy_from_env() -> pol.Policy:
@@ -113,6 +133,8 @@ def policy_from_env() -> pol.Policy:
         max_running=int(e("GRACE_SCHED_MAX_RUNNING", 4)),
         max_heavy=int(e("GRACE_SCHED_MAX_HEAVY", 2)),
         starve_secs=float(e("GRACE_SCHED_STARVE_SECS", 1800)),
+        settle_secs=float(e("GRACE_SCHED_SETTLE_SECS", 120)),
+        psi_max=float(e("GRACE_SCHED_PSI_MAX", 10)),
     )
 
 
@@ -120,7 +142,7 @@ def tick(d) -> pol.Decision:
     """One scheduling step, under the mutex: reclaim, decide, write reasons."""
     state.reap(d)
     res = state.reservation(d)
-    dec = pol.decide(queue_view(d), running_view(d), machine(d), policy_from_env(),
+    dec = pol.decide(queue_view(d), running_view(d, track=True), machine(d), policy_from_env(),
                      reserved_for=(res or {}).get("owner"),
                      reserved_exclusive=bool((res or {}).get("exclusive")), now=time.time())
     for v in state.entries(d, "queue"):

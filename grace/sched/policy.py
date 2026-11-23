@@ -56,6 +56,23 @@ class Policy:
     #: keeps them apart (Eric, 2026-11-20: persist's v62 push needs more than
     #: one heavy build at a time). 1 restores the old one-at-a-time rule.
     max_heavy: int = 2
+    #: RECLAIM (Borg's reservation reclamation, on one box): a running job that
+    #: has reached its peak and then stayed well under it gives back the
+    #: headroom it no longer needs. It must have reached `reach_fraction` of
+    #: its estimated peak (the build's link step, say), and then held at or
+    #: under `settle_fraction` of that maximum for `settle_secs`. Its
+    #: reservation drops to max(used x1.3, used + 1.5 GB). Its hard CAP does
+    #: not change, so the job can still grow; the PSI gate below and the floor
+    #: are what cover that (edge's 45.1.10 lib test held 9.2 GB at 2.5 GB used
+    #: for 17 min after linking while four jobs waited, 2026-11-22).
+    reach_fraction: float = 0.7
+    settle_fraction: float = 0.5
+    settle_secs: float = 120.0
+    #: PSI GATE: nothing starts while the box's memory pressure (the share of
+    #: the last 10 s some task stalled on memory, /proc/pressure/memory "some
+    #: avg10", in %) is above this. A static floor guesses at pressure; PSI
+    #: measures it (Meta's oomd/senpai). It only ever holds a start back.
+    psi_max: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -90,19 +107,44 @@ class Running:
     budget_gb: Optional[float] = None
     #: no memory limit at all: it may grow into everything available
     uncapped: bool = False
+    #: the reservation this job keeps after RECLAIM (see Policy), or None
+    reclaimed_gb: Optional[float] = None
+
+    def effective_peak(self) -> float:
+        return self.peak_gb if self.reclaimed_gb is None else min(self.peak_gb, self.reclaimed_gb)
 
     def heavy(self, p: Policy) -> bool:
-        return self.peak_gb > p.heavy_gb
+        return self.effective_peak() > p.heavy_gb
 
     def headroom_gb(self) -> float:
-        """What this job may still grow into before its cap stops it."""
+        """What this job may still grow into before its reservation is used.
+        Its cap, or after RECLAIM the smaller reservation it settled to."""
+        if self.reclaimed_gb is not None:
+            return max(0.0, self.reclaimed_gb - self.used_gb)
         return max(0.0, max(self.peak_gb, self.budget_gb or 0.0) - self.used_gb)
+
+
+def reclaim(peak_gb: float, used_gb: float, max_used_gb: float, settled_since: Optional[float],
+            now: float, policy: "Policy") -> Optional[float]:
+    """The reservation a running job settles to after its peak, or None while
+    it has not (see Policy.reach_fraction). Never above its estimated peak."""
+    if settled_since is None or peak_gb <= 0:
+        return None
+    if max_used_gb < policy.reach_fraction * peak_gb:
+        return None
+    if used_gb > policy.settle_fraction * max_used_gb:
+        return None
+    if now - settled_since < policy.settle_secs:
+        return None
+    return round(min(peak_gb, max(used_gb * 1.3, used_gb + 1.5)), 2)
 
 
 @dataclass(frozen=True)
 class Machine:
     available_gb: float
     disk_free_gb: float
+    #: /proc/pressure/memory "some avg10" (%), 0 where the kernel has no PSI
+    psi_some_avg10: float = 0.0
 
 
 @dataclass
@@ -143,6 +185,14 @@ def decide(
     #: v62 is the critical path; an edge test lane started beside a waiting
     #: critical lane would hold its memory for ten minutes).
     critical_waiting: Optional[Request] = None
+
+    if machine.psi_some_avg10 > policy.psi_max:
+        for r in queue:
+            d.waits[r.id] = (
+                f"memory pressure: tasks stalled on memory {machine.psi_some_avg10:.0f}% of the last "
+                f"10 s (over {policy.psi_max:.0f}%); waiting for it to ease"
+            )
+        return d
 
     if machine.disk_free_gb < policy.disk_floor_gb:
         for r in queue:

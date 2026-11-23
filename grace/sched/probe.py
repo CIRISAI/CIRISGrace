@@ -22,6 +22,20 @@ def available_gb() -> float:
     return 0.0
 
 
+def memory_pressure_some_avg10(path: str = "/proc/pressure/memory") -> float:
+    """The share (%) of the last 10 s in which some task stalled on memory, or
+    0.0 where the kernel exposes no PSI (it then only never holds a start)."""
+    try:
+        for line in Path(path).read_text().splitlines():
+            if line.startswith("some "):
+                for f in line.split()[1:]:
+                    if f.startswith("avg10="):
+                        return float(f.split("=", 1)[1])
+    except (OSError, ValueError):
+        pass
+    return 0.0
+
+
 def disk_free_gb(path: str = "/") -> float:
     return shutil.disk_usage(path).free / GIB
 
