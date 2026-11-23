@@ -68,6 +68,9 @@ class Request:
     created: float = 0.0
     #: what admission reserves: the job's hard cap (default: the estimate)
     budget_gb: Optional[float] = None
+    #: a SMALL job: its measured need stayed at or under SMALL_GB over its last
+    #: runs (see `is_small`), so it is admitted against half the floor
+    small: bool = False
 
     def heavy(self, p: Policy) -> bool:
         return self.peak_gb > p.heavy_gb
@@ -211,6 +214,14 @@ def decide(
         # cap. Only another heavy job does. A 2 GB localize task held persist's
         # critical clippy (13.2 + 8 = 21.2 GB against 21.0 free) while it used
         # 0.02 GB (2026-11-21).
+        # A SMALL job (measured need at or under SMALL_GB on each of its last
+        # LEARN_BELOW_RUNS runs): its cap must still fit, but its expected peak
+        # leaves only HALF the floor, even beside a heavy job. Four short jobs
+        # (persist's sqlite lane needing 0.1-0.24 GB, commit hooks) waited
+        # 7-17 min behind one edge test that had reserved 9.2 GB and was using
+        # 1.9 (2026-11-22). The full floor stays for everything else.
+        if r.small:
+            need = min(need, max(r.budget(), r.peak_gb + policy.floor_gb / 2))
         if not any(j.heavy(policy) for j in running) and not heavy_holders:
             # The cap plus a quarter of the floor (the worst case, the job at its
             # cap), and the EXPECTED peak plus half the floor (the sessions beside
@@ -240,6 +251,25 @@ def decide(
 #: The peak a job with no declaration and no history is admitted at.
 UNKNOWN_PEAK_GB = 6.0
 
+#: Measured runs before a kind's own history may set its estimate BELOW what
+#: its caller declared (and before it may count as a small job).
+LEARN_BELOW_RUNS = 3
+
+#: The least an estimate learned below a declaration goes to.
+LEARNED_MIN_GB = 0.5
+
+#: A job whose measured need stayed at or under this on each of its last
+#: LEARN_BELOW_RUNS runs is a small job (`Request.small`).
+SMALL_GB = 1.0
+
+
+def is_small(need_history_gb: List[float]) -> bool:
+    """Whether a kind's measured NEED (anonymous memory, not page cache) stayed
+    small on each of its last runs: at least LEARN_BELOW_RUNS of them, every
+    one of the last five at or under SMALL_GB."""
+    recent = need_history_gb[-5:]
+    return len(need_history_gb) >= LEARN_BELOW_RUNS and max(recent) <= SMALL_GB
+
 
 def estimate_peak(
     declared_gb: Optional[float],
@@ -258,6 +288,16 @@ def estimate_peak(
     if declared_gb is not None and seen is not None:
         if seen > declared_gb:
             return round(seen, 1), f"learned ({len(history_gb)} runs, above the declared {declared_gb:g})"
+        # Learned BELOW the declaration, once the kind has enough measured
+        # runs: a declaration is a caller's guess and the runs are the box's
+        # measurement. persist's sqlite lane was declared 3 GB and measured
+        # 0.1-0.24 GB on every run, and was admitted at 3 GB + the floor each
+        # time (2026-11-22). The CAP keeps the declaration (runner.plan), so a
+        # run that does grow is not killed early; only admission learns.
+        if len(history_gb) >= LEARN_BELOW_RUNS:
+            low = max(round(seen, 1), LEARNED_MIN_GB)
+            if low < declared_gb:
+                return low, f"learned ({len(history_gb)} runs, below the declared {declared_gb:g})"
         return float(declared_gb), "declared"
     if declared_gb is not None:
         return float(declared_gb), "declared"

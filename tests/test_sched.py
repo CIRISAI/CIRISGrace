@@ -186,6 +186,38 @@ class Policy(unittest.TestCase):
         self.assertEqual(pol.decide([crit], light, pol.Machine(17.0, BIG_DISK), P2).start, [],
                          "its cap plus half the floor must still fit beside the light job")
 
+    def test_a_small_job_waits_on_half_the_floor_beside_a_heavy_one(self):
+        # 2026-11-22: persist's sqlite lane (declared 3 GB, measured 0.1-0.24)
+        # waited behind an edge test that reserved 9.2 GB and used 1.9: 6.0 GB
+        # projected free against 3.0 + the 8 GB floor.
+        edge = [pol.Running("e", "edge", "test", 9.2, 1.9, budget_gb=9.2)]
+        box = pol.Machine(13.3, BIG_DISK)  # 13.3 - 7.3 headroom = 6.0 projected
+        small = pol.Request("s", "persist", "sqlite-lib", 0.5, budget_gb=4.5, small=True)
+        self.assertEqual(pol.decide([small], edge, box, P2).start, ["s"])
+        unsmall = pol.Request("u", "persist", "sqlite-lib", 0.5, budget_gb=4.5)
+        self.assertEqual(pol.decide([unsmall], edge, box, P2).start, [],
+                         "the same job without its measured history keeps the full floor")
+        tight = pol.Machine(11.0, BIG_DISK)  # 3.7 projected: its 4.5 GB cap no longer fits
+        self.assertEqual(pol.decide([small], edge, tight, P2).start, [],
+                         "a small job's cap must still fit")
+
+    def test_is_small_needs_three_measured_runs_all_small(self):
+        self.assertFalse(pol.is_small([0.1, 0.2]), "two runs are not a measurement")
+        self.assertTrue(pol.is_small([0.1, 0.2, 0.24]))
+        self.assertFalse(pol.is_small([0.1, 0.2, 1.7]), "one big recent run ends it")
+        self.assertTrue(pol.is_small([5.0, 0.1, 0.1, 0.1, 0.1, 0.1]), "only the last five count")
+
+    def test_a_declaration_is_learned_below_after_three_runs(self):
+        self.assertEqual(pol.estimate_peak(3.0, [0.1, 0.2]), (3.0, "declared"),
+                         "two runs do not move a declaration")
+        peak, source = pol.estimate_peak(3.0, [0.11, 0.17, 0.24])
+        self.assertEqual(peak, 0.5, "never below LEARNED_MIN_GB")
+        self.assertIn("below the declared 3", source)
+        peak, _ = pol.estimate_peak(8.0, [4.0, 5.0, 6.0])
+        self.assertEqual(peak, 6.9, "learned at the measured peak x1.15")
+        self.assertEqual(pol.estimate_peak(2.0, [1.9, 1.9, 1.9]),
+                         (2.2, "learned (3 runs, above the declared 2)"))
+
     def test_an_exclusive_reservation_holds_back_every_other_owner(self):
         # 2026-11-21: persist's certify needs the box free of foreign cargo; a
         # heavy-slot reservation still let light jobs backfill, so it waited forever.
@@ -427,6 +459,9 @@ class Run(unittest.TestCase):
         from grace.sched import runner
         self.assertEqual(runner.default_cap(6.0, "default (no declaration, no history)"), 11.0)
         self.assertEqual(runner.default_cap(2.0, "declared"), 3.5)
+        # A peak learned BELOW its declaration lowers admission, never the cap.
+        peak, source, cap = runner.plan(3.0, [0.11, 0.17, 0.24])
+        self.assertEqual((peak, cap), (0.5, runner.default_cap(3.0, "declared")), source)
         self.assertEqual(runner.default_cap(12.0, "learned (3 runs)", runs=3), 13.8)
 
     def test_one_quiet_run_does_not_shrink_an_undeclared_cap(self):

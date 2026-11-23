@@ -94,7 +94,8 @@ def running_view(d) -> List[pol.Running]:
 def queue_view(d) -> List[pol.Request]:
     return [
         pol.Request(v["id"], v["owner"], v["kind"], float(v["peak_gb"]), v.get("priority", "normal"),
-                    float(v.get("created", 0)), budget_gb=float(v.get("cap_gb") or v["peak_gb"]))
+                    float(v.get("created", 0)), budget_gb=float(v.get("cap_gb") or v["peak_gb"]),
+                    small=bool(v.get("small")))
         for v in state.entries(d, "queue")
     ]
 
@@ -202,7 +203,12 @@ def plan(declared_gb: Optional[float], history_gb: List[float],
     peak, source = pol.estimate_peak(declared_gb, history_gb)
     runs = len(history_gb)
     declared = declared_gb is not None
-    cap = round(cap_gb, 1) if cap_gb else default_cap(peak, source, runs, declared=declared)
+    # A peak learned BELOW the declaration lowers admission only: the cap is
+    # still set from the declaration, so the job keeps the room its caller
+    # asked for if this run does grow.
+    cap_peak = max(peak, declared_gb) if declared else peak
+    cap_source = "declared" if declared and cap_peak > peak else source
+    cap = round(cap_gb, 1) if cap_gb else default_cap(cap_peak, cap_source, runs, declared=declared)
     if not declared and 0 < runs < LEARN_RUNS and peak < pol.UNKNOWN_PEAK_GB:
         peak = pol.UNKNOWN_PEAK_GB
         source += f", warming up ({LEARN_RUNS} runs to learn): admitted as an unknown job"
@@ -295,13 +301,15 @@ def run(argv: List[str], owner: str, kind: str, declared_gb: Optional[float],
             _say(f"{too_big}; refusing ({EXIT_TOO_BIG}). Pass --cap to run it at a cap you choose.")
             return EXIT_TOO_BIG
         me = os.getpid()
+        small = pol.is_small(state.history(d, kind, need_only=True))
         req = {"id": job_id, "owner": owner, "kind": kind, "peak_gb": peak, "peak_source": source,
-               "cap_gb": cap, "scoped": scoped,
+               "cap_gb": cap, "scoped": scoped, "small": small,
                "priority": priority, "created": time.time(), "pid": me,
                "pid_start": probe.start_time(me), "cmd": " ".join(argv)[:300], "cwd": os.getcwd()}
         state.put(d, "queue", req)
         state.event(d, "requested", id=job_id, owner=owner, kind=kind, peak_gb=peak, priority=priority)
-    _say(f"{job_id} queued: {owner}:{kind}, peak {peak:g} GB ({source}), cap {cap:g} GB, {priority}")
+    _say(f"{job_id} queued: {owner}:{kind}, peak {peak:g} GB ({source}), cap {cap:g} GB, {priority}"
+         + (", small (half the floor)" if small else ""))
 
     t0 = time.time()
     last_why = None
