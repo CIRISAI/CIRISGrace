@@ -221,6 +221,16 @@ class Policy(unittest.TestCase):
         self.assertEqual(pol.decide([waiting], [held], box, P2).start, [], "before: 15 - 6.7 = 8.3 < 10")
         self.assertEqual(pol.decide([waiting], [edge], box, P2).start, ["v"], "after: 15 - 1.5 = 13.5")
 
+    def test_a_small_job_backfills_past_a_starving_head(self):
+        head = pol.Request("h", "persist", "seam-check", 8.0, budget_gb=9.5, created=0)
+        small = pol.Request("s", "verify", "cargo test", 0.5, budget_gb=2.0, created=10, small=True)
+        big = pol.Request("b", "edge", "clippy", 5.0, budget_gb=7.0, created=20)
+        box = pol.Machine(10.0, BIG_DISK)
+        d = pol.decide([head, small, big], [], box, P2, now=P2.starve_secs + 100)
+        self.assertNotIn("h", d.start, "the head still cannot fit")
+        self.assertIn("s", d.start, d.waits)
+        self.assertIn("nothing passes it now", d.waits["b"])
+
     def test_memory_pressure_holds_every_start(self):
         light = pol.Request("l", "CIRISClient", "gates", 1.0, budget_gb=2.0)
         calm = pol.Machine(28, BIG_DISK, psi_some_avg10=2.0)

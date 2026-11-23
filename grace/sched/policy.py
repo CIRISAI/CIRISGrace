@@ -212,7 +212,13 @@ def decide(
         return d
 
     for r in order(queue):
-        if head_starving is not None:
+        # BACKFILL past a starving head (Slurm's idea, sized to this box): a
+        # SMALL job (measured need <= SMALL_GB on its last runs) may still
+        # start, because it takes too little to matter to the head and ends
+        # soon. Everything else waits behind the head. One 9.5 GB lane that
+        # could not fit held five jobs for 30+ min, two of them commit hooks
+        # and a 0.3 GB test (2026-11-22).
+        if head_starving is not None and not r.small:
             d.waits[r.id] = (
                 f"behind {head_starving.owner}:{head_starving.kind}, which has waited "
                 f"{(now - head_starving.created) / 60:.0f} min; nothing passes it now"
